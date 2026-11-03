@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
-from collections.abc import Callable
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from .models import Exercise
-from .music import PitchObservation, expected_events, frequency_to_midi, midi_to_frequency
+from .music import PitchObservation, frequency_to_midi, midi_to_frequency
 
 
 SAMPLE_RATE = 48_000
+
+# The sounddevice wheel ships separate PortAudio DLLs.  The ASIO-enabled one
+# still includes MME, DirectSound, WASAPI, and WDM-KS, so use it by default on
+# Windows to make professional interfaces available without launch-time flags.
+if sys.platform == "win32":
+    os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
 
 def list_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
@@ -19,13 +26,22 @@ def list_audio_devices() -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
     inputs: list[tuple[int, str]] = []
     outputs: list[tuple[int, str]] = []
+    host_apis = sd.query_hostapis()
     for index, device in enumerate(sd.query_devices()):
-        label = f"{device['name']} ({device['hostapi']})"
+        host_name = host_apis[device["hostapi"]]["name"]
+        label = f"{device['name']} [{host_name}]"
         if device["max_input_channels"] > 0:
             inputs.append((index, label))
         if device["max_output_channels"] > 0:
             outputs.append((index, label))
     return inputs, outputs
+
+
+def compensate_input_latency(elapsed: float, latency: float) -> float:
+    """Map callback delivery time back to the estimated ADC capture time."""
+    if not np.isfinite(latency):
+        latency = 0.0
+    return max(0.0, elapsed - max(0.0, latency))
 
 
 def _pluck(frequency: float, duration: float, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
@@ -111,12 +127,21 @@ def detect_pitch(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> tuple[f
     confidence = float(corr[lag])
     if confidence < 0.25:
         return None, confidence
+    refined_lag = float(lag)
     if 1 <= lag < len(corr) - 1:
         left, center, right = corr[lag - 1], corr[lag], corr[lag + 1]
         denominator = left - 2 * center + right
         if abs(denominator) > 1e-9:
-            lag += float(0.5 * (left - right) / denominator)
-    return sample_rate / lag, confidence
+            correction = float(0.5 * (left - right) / denominator)
+            # The selected peak can be at the edge of the search region.  In
+            # that case the point just outside the region can make parabolic
+            # interpolation explode far beyond the neighboring samples.
+            if np.isfinite(correction) and abs(correction) <= 1.0:
+                refined_lag += correction
+    frequency = sample_rate / refined_lag
+    if not np.isfinite(frequency) or not 65.0 <= frequency <= 1200.0:
+        return None, confidence
+    return frequency, confidence
 
 
 class AudioEngine(QObject):
@@ -124,6 +149,8 @@ class AudioEngine(QObject):
     playback_finished = Signal(list, bool)
     error = Signal(str)
     metronome_changed = Signal(bool)
+    observation_detected = Signal(float, float, float)
+    input_latency_changed = Signal(float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -177,23 +204,42 @@ class AudioEngine(QObject):
         previous_rms = 0.0
         last_observation = -1.0
         analysis_buffer = np.empty(0, dtype=np.float32)
+        analysis_error_reported = False
+        input_latency = 0.0
 
         def input_callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
-            nonlocal previous_rms, last_observation, analysis_buffer
+            nonlocal previous_rms, last_observation, analysis_buffer, analysis_error_reported
             if status:
                 return
-            chunk = np.asarray(indata[:, 0], dtype=np.float32).copy()
-            analysis_buffer = np.concatenate((analysis_buffer, chunk))[-4096:]
-            rms = float(np.sqrt(np.mean(chunk * chunk)))
-            now = time.monotonic() - started
-            attack = rms > max(0.009, previous_rms * 1.35)
-            periodic = rms > 0.012 and now - last_observation > 0.10
-            if len(analysis_buffer) >= 2048 and (attack or periodic):
-                frequency, confidence = detect_pitch(analysis_buffer)
-                if frequency and confidence >= 0.32:
-                    observations.append(PitchObservation(now, frequency_to_midi(frequency), confidence, rms))
-                    last_observation = now
-            previous_rms = previous_rms * 0.7 + rms * 0.3
+            try:
+                chunk = np.asarray(indata[:, 0], dtype=np.float32).copy()
+                analysis_buffer = np.concatenate((analysis_buffer, chunk))[-4096:]
+                rms = float(np.sqrt(np.mean(chunk * chunk)))
+                callback_latency = input_latency
+                try:
+                    measured = float(time_info.currentTime - time_info.inputBufferAdcTime)
+                    if np.isfinite(measured) and measured >= 0:
+                        callback_latency = measured
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                now = compensate_input_latency(time.monotonic() - started, callback_latency)
+                attack = rms > max(0.009, previous_rms * 1.35)
+                periodic = rms > 0.012 and now - last_observation > 0.10
+                if len(analysis_buffer) >= 2048 and (attack or periodic):
+                    frequency, confidence = detect_pitch(analysis_buffer)
+                    if frequency is not None and confidence >= 0.32:
+                        midi = frequency_to_midi(frequency)
+                        observations.append(PitchObservation(now, midi, confidence, rms))
+                        self.observation_detected.emit(now, midi, confidence)
+                        last_observation = now
+                previous_rms = previous_rms * 0.7 + rms * 0.3
+            except Exception as exc:
+                # Exceptions escaping a PortAudio callback are rendered as a
+                # Python-CFFI error dialog and leave the session half-alive.
+                if not analysis_error_reported:
+                    analysis_error_reported = True
+                    self._stop.set()
+                    self.error.emit(f"入力音声の解析に失敗しました: {exc}")
 
         try:
             audio = render_exercise(
@@ -206,6 +252,9 @@ class AudioEngine(QObject):
                     blocksize=1024, callback=input_callback,
                 )
                 stream.start()
+                latency_value = stream.latency
+                input_latency = float(latency_value[0] if isinstance(latency_value, tuple) else latency_value)
+                self.input_latency_changed.emit(input_latency)
             started = time.monotonic()
             sd.play(audio, samplerate=SAMPLE_RATE, device=output_device, blocking=False)
             step_seconds = 60.0 / bpm / exercise.steps_per_beat

@@ -56,7 +56,7 @@ setup(
     options={"build_exe": build_exe_options},
     executables=[
         Executable(
-            "gt_trainer.pyw",
+            "guitar_trainer.pyw",
             base=base,
             target_name="GuitarTrainer.exe" if sys.platform == "win32" else "GuitarTrainer",
             shortcut_name="Guitar Trainer",

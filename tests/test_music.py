@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
-from gt_trainer.audio import detect_pitch
-from gt_trainer.models import Exercise, TabNote
+from gt_trainer.audio import compensate_input_latency, detect_pitch
+from gt_trainer.models import Exercise, TabNote, format_tab_cell, parse_tab_cell
 from gt_trainer.music import (
     PitchObservation,
     evaluate_performance,
@@ -18,6 +18,27 @@ def test_frequency_midi_round_trip() -> None:
     assert midi_to_frequency(69) == pytest.approx(440.0)
     assert frequency_to_midi(440.0) == pytest.approx(69.0)
     assert frequency_to_midi(midi_to_frequency(40)) == pytest.approx(40.0)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("0", (0, "")), ("24h", (24, "h")), ("7P", (7, "p")), ("9/", (9, "/")), ("9\\", (9, "\\"))],
+)
+def test_tab_cell_techniques(text: str, expected: tuple[int, str]) -> None:
+    assert parse_tab_cell(text) == expected
+    fret, technique = expected
+    assert format_tab_cell(TabNote(0, 0, fret, technique=technique)) == text.lower()
+
+
+@pytest.mark.parametrize("text", ["-1", "25", "h5", "5x", "5hh"])
+def test_invalid_tab_cells(text: str) -> None:
+    assert parse_tab_cell(text) is None
+
+
+def test_input_latency_is_subtracted_safely() -> None:
+    assert compensate_input_latency(1.0, 0.0058) == pytest.approx(0.9942)
+    assert compensate_input_latency(0.002, 0.0058) == 0.0
+    assert compensate_input_latency(1.0, float("nan")) == 1.0
 
 
 def test_evaluation_matches_pitch_and_timing() -> None:
@@ -54,4 +75,25 @@ def test_pitch_detector_on_clean_tone(frequency: float) -> None:
     detected, confidence = detect_pitch(samples, sample_rate)
     assert detected == pytest.approx(frequency, rel=0.015)
     assert confidence > 0.5
+
+
+def test_pitch_detector_rejects_runaway_peak_interpolation(monkeypatch) -> None:
+    """A search-boundary peak must not produce a negative frequency."""
+    samples = np.sin(2 * np.pi * 110 * np.arange(2048) / 48_000).astype(np.float32)
+    correlation = np.zeros(4096, dtype=np.float64)
+    correlation[0] = 1.0
+    # max_lag is 738 at 48 kHz.  The last in-range value is the selected
+    # maximum, while the first out-of-range value makes an unconstrained
+    # parabolic correction jump to a negative lag.
+    correlation[736] = 0.499
+    correlation[737] = 0.5
+    correlation[738] = 0.501001
+    monkeypatch.setattr(np.fft, "irfft", lambda *args, **kwargs: correlation.copy())
+
+    detected, confidence = detect_pitch(samples, 48_000)
+
+    assert detected is not None
+    assert np.isfinite(detected)
+    assert 65.0 <= detected <= 1200.0
+    assert confidence == pytest.approx(0.5)
 

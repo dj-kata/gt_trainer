@@ -19,11 +19,11 @@ test:
 	@$(WUV) run --extra dev pytest -q
 
 check:
-	@$(WUV) run --extra dev python -m compileall -q src tests setup.py gt_trainer.pyw
+	@$(WUV) run --extra dev python -m compileall -q src tests setup.py guitar_trainer.pyw
 	@$(WUV) run --extra dev pytest -q
 
 run:
-	@$(WUV) run python gt_trainer.pyw
+	@$(WUV) run python guitar_trainer.pyw
 
 build:
 	@rm -rf $(DIST_DIR)

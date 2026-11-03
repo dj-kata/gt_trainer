@@ -119,6 +119,8 @@ class MainWindow(QMainWindow):
         self.audio.playback_finished.connect(self._playback_finished)
         self.audio.error.connect(self._audio_error)
         self.audio.metronome_changed.connect(self.metronome.setChecked)
+        self.audio.observation_detected.connect(self._observation_detected)
+        self.audio.input_latency_changed.connect(self._input_latency_changed)
         self.refresh_devices()
         self.show_page(0)
 
@@ -164,16 +166,28 @@ class MainWindow(QMainWindow):
         self.active_exercise = exercise
         self.active_assessment = assess
         self.practice.set_running(True, assess)
+        count_in_beats = exercise.beats_per_bar
+        self.practice.prepare_staff(exercise, self.bpm.value(), count_in_beats)
         # During assessment, the guide notes are muted so they cannot leak into pitch detection.
         self.audio.play(
             exercise, self.bpm.value(), self.output_device.currentData(),
             input_device=self.input_device.currentData(), assess=assess,
-            include_notes=not assess, count_in_beats=exercise.beats_per_bar,
+            include_notes=not assess, count_in_beats=count_in_beats,
         )
+
+    def _observation_detected(self, observed_time: float, midi: float, confidence: float) -> None:
+        if self.active_assessment:
+            self.practice.add_detected_note(observed_time, midi)
+
+    def _input_latency_changed(self, latency_seconds: float) -> None:
+        if self.active_assessment:
+            self.practice.set_input_latency(latency_seconds)
 
     def _position_changed(self, step: int) -> None:
         self.practice.preview_grid.set_playhead(step)
+        self.practice.staff.set_playhead(step)
         self.editor.grid.set_playhead(step)
+        self.editor.staff.set_playhead(step)
 
     def _playback_finished(self, observations: list, cancelled: bool) -> None:
         self.practice.set_running(False)

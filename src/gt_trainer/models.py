@@ -2,12 +2,26 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import re
 from typing import Any
 
 
 STRING_NAMES = ("e", "B", "G", "D", "A", "E")
 # MIDI notes for standard tuning, displayed from the first/high string.
 OPEN_STRING_MIDI = (64, 59, 55, 50, 45, 40)
+TAB_CELL_PATTERN = re.compile(r"^(?P<fret>[0-9]|1[0-9]|2[0-4])(?P<technique>[hHpPsS/\\]?)$")
+
+
+def parse_tab_cell(value: str) -> tuple[int, str] | None:
+    """Parse a fret and optional transition marker from one TAB cell."""
+    match = TAB_CELL_PATTERN.fullmatch(value.strip())
+    if not match:
+        return None
+    return int(match.group("fret")), match.group("technique").lower()
+
+
+def format_tab_cell(note: "TabNote") -> str:
+    return f"{note.fret}{note.technique}"
 
 
 @dataclass(slots=True)
@@ -16,6 +30,8 @@ class TabNote:
     string: int
     fret: int
     duration_steps: int = 1
+    # Transition from this note to the next: h, p, s, /, or \.
+    technique: str = ""
 
     @property
     def midi_note(self) -> int:
