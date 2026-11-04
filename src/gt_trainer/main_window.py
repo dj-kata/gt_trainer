@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .audio import AudioEngine, list_audio_devices
+from .audio import AudioEngine, list_audio_devices, playback_end_step
 from .models import Exercise, SessionResult
 from .music import evaluate_performance, score_attempts
 from .storage import Storage
@@ -114,7 +114,10 @@ class MainWindow(QMainWindow):
         self.practice.stop_requested.connect(self.audio.stop)
         self.practice.edit_requested.connect(self.edit_exercise)
         self.editor.saved.connect(self._exercise_saved)
-        self.editor.preview_requested.connect(lambda ex: self.start_practice(ex, False))
+        self.editor.preview_requested.connect(
+            lambda exercise, start_step: self.start_practice(exercise, False, start_step)
+        )
+        self.editor.stop_requested.connect(self.audio.stop)
         self.audio.position_changed.connect(self._position_changed)
         self.audio.playback_finished.connect(self._playback_finished)
         self.audio.error.connect(self._audio_error)
@@ -157,15 +160,22 @@ class MainWindow(QMainWindow):
         else:
             self.audio.stop_metronome()
 
-    def start_practice(self, exercise: Exercise, assess: bool) -> None:
+    def start_practice(self, exercise: Exercise, assess: bool, start_step: int = 0) -> None:
         if self.audio.busy:
             return
-        if assess and not exercise.notes:
-            QMessageBox.warning(self, "譜面が空です", "採点するノートがありません。")
+        start_step = min(max(0, start_step), exercise.total_steps)
+        if playback_end_step(exercise, start_step) is None:
+            message = (
+                "カーソル位置以降に再生する音符がありません。"
+                if start_step > 0
+                else "再生する音符がありません。"
+            )
+            QMessageBox.warning(self, "譜面が空です", message)
             return
         self.active_exercise = exercise
         self.active_assessment = assess
         self.practice.set_running(True, assess)
+        self.editor.set_running(True)
         count_in_beats = exercise.beats_per_bar
         self.practice.prepare_staff(exercise, self.bpm.value(), count_in_beats)
         # During assessment, the guide notes are muted so they cannot leak into pitch detection.
@@ -173,6 +183,7 @@ class MainWindow(QMainWindow):
             exercise, self.bpm.value(), self.output_device.currentData(),
             input_device=self.input_device.currentData(), assess=assess,
             include_notes=not assess, count_in_beats=count_in_beats,
+            start_step=start_step,
         )
 
     def _observation_detected(self, observed_time: float, midi: float, confidence: float) -> None:
@@ -191,6 +202,7 @@ class MainWindow(QMainWindow):
 
     def _playback_finished(self, observations: list, cancelled: bool) -> None:
         self.practice.set_running(False)
+        self.editor.set_running(False)
         if cancelled or not self.active_assessment or not self.active_exercise:
             return
         attempts = evaluate_performance(
@@ -219,6 +231,7 @@ class MainWindow(QMainWindow):
 
     def _audio_error(self, message: str) -> None:
         self.practice.set_running(False)
+        self.editor.set_running(False)
         QMessageBox.critical(self, "音声エラー", message)
 
     def edit_exercise(self, exercise: Exercise) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QModelIndex, QRect, QRegularExpression, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QModelIndex, QRect, QRegularExpression, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -25,6 +27,9 @@ from PySide6.QtWidgets import (
 from .models import Exercise, STRING_NAMES, TabNote, format_tab_cell, parse_tab_cell
 from .staff import StaffWidget
 from .storage import Storage
+
+
+TAB_CLIPBOARD_MIME = "application/x-gt-trainer-tab"
 
 
 def card(title: str) -> tuple[QGroupBox, QVBoxLayout]:
@@ -75,7 +80,7 @@ class TabCellDelegate(QStyledItemDelegate):
                 QTimer.singleShot(0, self.redo_requested.emit)
                 return True
             if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() in (
-                Qt.Key.Key_C, Qt.Key.Key_V, Qt.Key.Key_Left, Qt.Key.Key_Right,
+                Qt.Key.Key_C, Qt.Key.Key_X, Qt.Key.Key_V, Qt.Key.Key_Left, Qt.Key.Key_Right,
                 Qt.Key.Key_Up, Qt.Key.Key_Down,
             ):
                 key = event.key()
@@ -148,6 +153,7 @@ class TimelineHeader(QHeaderView):
             rect = self.bar_geometry(bar)
             if not rect.intersects(self.viewport().rect()):
                 continue
+            painter.fillRect(rect.adjusted(0, 0, -1, -1), QColor("#243249"))
             painter.setPen(border)
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
             painter.setPen(text_color)
@@ -165,6 +171,7 @@ class TabGrid(QTableWidget):
         self._history_index = 0
         self._applying_history = False
         self._cell_values: dict[tuple[int, int], str] = {}
+        self._playhead_step = -1
         self.setHorizontalHeader(TimelineHeader(self))
         self.setVerticalHeaderLabels(STRING_NAMES)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -289,11 +296,55 @@ class TabGrid(QTableWidget):
                 self.item(row, column).text() if self.item(row, column) is not None else ""
                 for column in range(min_column, max_column + 1)
             ))
-        QApplication.clipboard().setText("\n".join(rows))
+        tab_cells = [
+            [row, column - min_column, self.item(row, column).text()]
+            for row in range(min_row, max_row + 1)
+            for column in range(min_column, max_column + 1)
+            if self.item(row, column) is not None
+        ]
+        mime_data = QMimeData()
+        mime_data.setText("\n".join(rows))
+        mime_data.setData(
+            TAB_CLIPBOARD_MIME,
+            json.dumps({"cells": tab_cells}, ensure_ascii=False).encode("utf-8"),
+        )
+        QApplication.clipboard().setMimeData(mime_data)
+
+    def cut_selection(self) -> None:
+        selected = self.selectedItems()
+        if not selected:
+            return
+        self.copy_selection()
+        self._apply_batch_edit({(item.row(), item.column()): "" for item in selected})
 
     def paste_selection(self) -> None:
-        anchor_row = max(0, self.currentRow())
         anchor_column = max(0, self.currentColumn())
+        mime_data = QApplication.clipboard().mimeData()
+        if mime_data.hasFormat(TAB_CLIPBOARD_MIME):
+            try:
+                payload = json.loads(bytes(mime_data.data(TAB_CLIPBOARD_MIME)).decode("utf-8"))
+                cells = payload["cells"]
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                cells = []
+            updates: dict[tuple[int, int], str] = {}
+            for cell in cells:
+                if not isinstance(cell, list) or len(cell) != 3:
+                    continue
+                row, column_offset, value = cell
+                if not isinstance(row, int) or not isinstance(column_offset, int):
+                    continue
+                column = anchor_column + column_offset
+                value = value.strip() if isinstance(value, str) else ""
+                if (
+                    0 <= row < self.rowCount()
+                    and 0 <= column < self.columnCount()
+                    and (not value or parse_tab_cell(value) is not None)
+                ):
+                    updates[(row, column)] = value
+            self._apply_batch_edit(updates)
+            return
+
+        anchor_row = max(0, self.currentRow())
         clipboard_rows = QApplication.clipboard().text().splitlines()
         updates: dict[tuple[int, int], str] = {}
         for row_offset, clipboard_row in enumerate(clipboard_rows):
@@ -349,6 +400,8 @@ class TabGrid(QTableWidget):
     def _handle_control_shortcut(self, key: int) -> bool:
         if key == Qt.Key.Key_C:
             self.copy_selection()
+        elif key == Qt.Key.Key_X:
+            self.cut_selection()
         elif key == Qt.Key.Key_V:
             self.paste_selection()
         elif key == Qt.Key.Key_Right:
@@ -436,6 +489,7 @@ class TabGrid(QTableWidget):
             if note.step < total_steps:
                 self.item(note.string, note.step).setText(format_tab_cell(note))
         self.blockSignals(blocked)
+        self._playhead_step = -1
         self._reset_edit_history()
         self.timeline_geometry_changed.emit()
         QTimer.singleShot(0, self._update_fixed_height)
@@ -464,15 +518,20 @@ class TabGrid(QTableWidget):
         self._reset_edit_history()
 
     def set_playhead(self, step: int) -> None:
-        for row in range(self.rowCount()):
-            for column in range(self.columnCount()):
+        previous_step = self._playhead_step
+        self._playhead_step = step if 0 <= step < self.columnCount() else -1
+        for column in {previous_step, self._playhead_step}:
+            if not 0 <= column < self.columnCount():
+                continue
+            shade = (
+                QColor("#3b5564")
+                if column == self._playhead_step
+                else QColor("#202735") if column % self.steps_per_beat == 0 else QColor("#181e29")
+            )
+            for row in range(self.rowCount()):
                 item = self.item(row, column)
-                if not item:
-                    continue
-                if column == step:
-                    item.setBackground(QColor("#3b5564"))
-                else:
-                    item.setBackground(QColor("#202735") if column % self.steps_per_beat == 0 else QColor("#181e29"))
+                if item:
+                    item.setBackground(shade)
         if 0 <= step < self.columnCount():
             target = self.item(0, step)
             if target:
@@ -481,7 +540,8 @@ class TabGrid(QTableWidget):
 
 class EditorPage(QWidget):
     saved = Signal()
-    preview_requested = Signal(Exercise)
+    preview_requested = Signal(Exercise, int)
+    stop_requested = Signal()
 
     def __init__(self, storage: Storage) -> None:
         super().__init__()
@@ -497,7 +557,7 @@ class EditorPage(QWidget):
         description = QLabel(
             "0〜24のフレット番号を入力し Enter で右へ移動します。奏法は 5h（ハンマリング）、"
             "7p（プリング）、9/・9\\（スライド）です。ドラッグで複数選択し、Ctrl+C / Ctrl+V でコピー・"
-            "貼り付け、Ctrl+矢印でフレット・弦を移動できます。"
+            "貼り付け、Ctrl+X で切り取り、Ctrl+矢印でフレット・弦を移動できます。"
         )
         description.setObjectName("muted")
         root.addWidget(description)
@@ -506,8 +566,13 @@ class EditorPage(QWidget):
         self.name = QLineEdit("クロマチック練習")
         self.name.setPlaceholderText("練習名")
         self.bars = QSpinBox()
-        self.bars.setRange(1, 8)
+        self.bars.setRange(1, 256)
         self.bars.setValue(1)
+        self.bars.setKeyboardTracking(False)
+        self.bars.setAccelerated(True)
+        self.bars.setToolTip(
+            "1〜256小節。数値を直接入力するか、矢印を長押しして変更できます。"
+        )
         self.subdivision = QComboBox()
         self.subdivision.addItem("4分音符", 1)
         self.subdivision.addItem("8分音符", 2)
@@ -517,7 +582,7 @@ class EditorPage(QWidget):
         self.subdivision.setCurrentIndex(self.subdivision.findData(4))
         controls.addWidget(QLabel("名前"))
         controls.addWidget(self.name, 2)
-        controls.addWidget(QLabel("小節"))
+        controls.addWidget(QLabel("小節数"))
         controls.addWidget(self.bars)
         controls.addWidget(QLabel("分割"))
         controls.addWidget(self.subdivision)
@@ -532,14 +597,22 @@ class EditorPage(QWidget):
         buttons = QHBoxLayout()
         new_button = QPushButton("新規")
         new_button.clicked.connect(self.new_exercise)
-        preview = QPushButton("▶  プレビュー")
-        preview.clicked.connect(lambda: self.preview_requested.emit(self.build_exercise()))
+        self.play_from_start_button = QPushButton("▶  先頭から")
+        self.play_from_start_button.clicked.connect(lambda: self._request_preview(0))
+        self.play_from_cursor_button = QPushButton("▶  カーソルから")
+        self.play_from_cursor_button.setToolTip("選択中のTAB列から再生します。")
+        self.play_from_cursor_button.clicked.connect(self._request_preview_from_cursor)
+        self.stop_button = QPushButton("■  停止")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_requested.emit)
         save = QPushButton("保存")
         save.setObjectName("primaryButton")
         save.clicked.connect(self.save)
         buttons.addWidget(new_button)
         buttons.addStretch()
-        buttons.addWidget(preview)
+        buttons.addWidget(self.play_from_start_button)
+        buttons.addWidget(self.play_from_cursor_button)
+        buttons.addWidget(self.stop_button)
         buttons.addWidget(save)
         root.addLayout(buttons)
 
@@ -563,6 +636,17 @@ class EditorPage(QWidget):
 
     def _update_staff(self) -> None:
         self.staff.set_exercise(self.build_exercise())
+
+    def _request_preview(self, start_step: int) -> None:
+        self.preview_requested.emit(self.build_exercise(), start_step)
+
+    def _request_preview_from_cursor(self) -> None:
+        self._request_preview(max(0, self.grid.currentColumn()))
+
+    def set_running(self, running: bool) -> None:
+        self.play_from_start_button.setEnabled(not running)
+        self.play_from_cursor_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
 
     def build_exercise(self) -> Exercise:
         return Exercise(

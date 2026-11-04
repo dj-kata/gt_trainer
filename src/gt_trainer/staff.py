@@ -87,6 +87,10 @@ class StaffWidget(QWidget):
     def _step_x(self, step: float) -> float:
         return self.timeline_left + (step + 0.5) * self.pixels_per_step - self.scroll_offset
 
+    def _step_boundary_x(self, step: float) -> float:
+        """Return the TAB column boundary for a step on the shared timeline."""
+        return self.timeline_left + step * self.pixels_per_step - self.scroll_offset
+
     @staticmethod
     def _staff_position(midi: float) -> tuple[float, bool]:
         # Guitar treble notation is written one octave above sounding pitch.
@@ -161,15 +165,36 @@ class StaffWidget(QWidget):
             painter.drawLine(int(left), int(y), int(right), int(y))
 
         painter.save()
-        painter.setClipRect(QRectF(left, top - 14, right - left, self.height() - top + 5))
+        painter.setClipRect(QRectF(left, top - 18, right - left, self.height() - top + 9))
 
         # Beat and bar guides. Their x positions use exactly the same pixel
-        # width and scroll offset as the TAB columns above.
-        for step in range(0, self.exercise.total_steps, self.exercise.steps_per_beat):
-            x = self._step_x(step)
-            strong = step % (self.exercise.steps_per_beat * self.exercise.beats_per_bar) == 0
-            painter.setPen(QPen(QColor("#3b495e"), 1.5 if strong else 0.7))
-            painter.drawLine(int(x), int(top - 5), int(x), int(bottom + 7))
+        # width and scroll offset as the TAB columns above.  Guides sit on
+        # column boundaries so they do not run through notes on the beat.
+        steps_per_beat = max(1, self.exercise.steps_per_beat)
+        steps_per_bar = steps_per_beat * max(1, self.exercise.beats_per_bar)
+        for step in range(0, self.exercise.total_steps + 1, steps_per_beat):
+            x = self._step_boundary_x(step)
+            strong = step % steps_per_bar == 0
+            if strong:
+                painter.setPen(QPen(QColor("#64748b"), 2.0))
+                painter.drawLine(int(x), int(top - 5), int(x), int(bottom + 7))
+            elif step < self.exercise.total_steps:
+                painter.setPen(QPen(QColor("#3b495e"), 1.0, Qt.PenStyle.DashLine))
+                painter.drawLine(int(x), int(top), int(x), int(bottom))
+
+        painter.setFont(QFont("Noto Sans CJK JP", 7, QFont.Weight.Bold))
+        for bar_start in range(0, self.exercise.total_steps, steps_per_bar):
+            x = self._step_boundary_x(bar_start)
+            label_rect = QRectF(x + 4, top - 16, 18, 12)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#334155"))
+            painter.drawRoundedRect(label_rect, 3, 3)
+            painter.setPen(QColor("#cbd5e1"))
+            painter.drawText(
+                label_rect,
+                Qt.AlignmentFlag.AlignCenter,
+                str(bar_start // steps_per_bar + 1),
+            )
 
         expected = sorted(self.exercise.notes, key=lambda note: (note.step, note.string))
         for index, note in enumerate(expected):

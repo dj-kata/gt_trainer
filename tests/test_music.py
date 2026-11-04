@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
-from gt_trainer.audio import compensate_input_latency, detect_pitch
+from gt_trainer.audio import (
+    compensate_input_latency,
+    detect_pitch,
+    playback_end_step,
+    render_exercise,
+)
 from gt_trainer.models import Exercise, TabNote, format_tab_cell, parse_tab_cell
 from gt_trainer.music import (
     PitchObservation,
@@ -39,6 +44,31 @@ def test_input_latency_is_subtracted_safely() -> None:
     assert compensate_input_latency(1.0, 0.0058) == pytest.approx(0.9942)
     assert compensate_input_latency(0.002, 0.0058) == 0.0
     assert compensate_input_latency(1.0, float("nan")) == 1.0
+
+
+def test_playback_range_stops_at_last_remaining_note() -> None:
+    exercise = Exercise(steps_per_beat=4, bars=8, notes=[
+        TabNote(step=4, string=5, fret=0),
+        TabNote(step=20, string=5, fret=2, duration_steps=2),
+    ])
+
+    assert playback_end_step(exercise) == 22
+    assert playback_end_step(exercise, start_step=8) == 22
+    assert playback_end_step(exercise, start_step=21) is None
+
+
+def test_render_exercise_can_start_from_middle_and_trims_empty_tail() -> None:
+    exercise = Exercise(steps_per_beat=4, bars=8, notes=[
+        TabNote(step=4, string=5, fret=0),
+        TabNote(step=20, string=5, fret=2),
+    ])
+
+    audio = render_exercise(
+        exercise, 60, count_in_beats=0, sample_rate=1_000, start_step=8,
+    )
+
+    assert len(audio) == 3_750
+    assert np.any(audio != 0)
 
 
 def test_evaluation_matches_pitch_and_timing() -> None:

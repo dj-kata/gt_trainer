@@ -65,6 +65,16 @@ def _click(accent: bool, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return (np.sin(2 * np.pi * frequency * t) * np.exp(-70 * t) * (0.65 if accent else 0.45)).astype(np.float32)
 
 
+def playback_end_step(exercise: Exercise, start_step: int = 0) -> int | None:
+    """Return the end of the last note that starts at or after start_step."""
+    ends = [
+        note.step + max(1, note.duration_steps)
+        for note in exercise.notes
+        if note.step >= start_step
+    ]
+    return max(ends, default=None)
+
+
 def render_exercise(
     exercise: Exercise,
     bpm: int,
@@ -72,25 +82,36 @@ def render_exercise(
     count_in_beats: int = 4,
     include_notes: bool = True,
     sample_rate: int = SAMPLE_RATE,
+    start_step: int = 0,
 ) -> np.ndarray:
+    start_step = min(max(0, start_step), exercise.total_steps)
+    end_step = playback_end_step(exercise, start_step) or start_step
     beat_seconds = 60.0 / bpm
-    body_seconds = exercise.total_steps / exercise.steps_per_beat * beat_seconds
+    step_seconds = beat_seconds / exercise.steps_per_beat
+    body_seconds = (end_step - start_step) * step_seconds
     total_seconds = count_in_beats * beat_seconds + body_seconds + 0.5
     audio = np.zeros(int(total_seconds * sample_rate), dtype=np.float32)
 
-    total_beats = count_in_beats + exercise.beats_per_bar * exercise.bars
-    for beat in range(total_beats):
+    for beat in range(count_in_beats):
         start = int(beat * beat_seconds * sample_rate)
-        in_body = beat >= count_in_beats
-        bar_beat = (beat - count_in_beats) % exercise.beats_per_bar if in_body else beat % exercise.beats_per_bar
-        sound = _click(bar_beat == 0, sample_rate)
+        sound = _click(beat % exercise.beats_per_bar == 0, sample_rate)
+        audio[start:start + len(sound)] += sound
+
+    first_beat_step = (
+        (start_step + exercise.steps_per_beat - 1) // exercise.steps_per_beat
+    ) * exercise.steps_per_beat
+    body_offset = count_in_beats * beat_seconds
+    for step in range(first_beat_step, end_step, exercise.steps_per_beat):
+        start = int((body_offset + (step - start_step) * step_seconds) * sample_rate)
+        beat = step // exercise.steps_per_beat
+        sound = _click(beat % exercise.beats_per_bar == 0, sample_rate)
         audio[start:start + len(sound)] += sound
 
     if include_notes:
-        step_seconds = beat_seconds / exercise.steps_per_beat
-        offset = count_in_beats * beat_seconds
         for note in exercise.notes:
-            start = int((offset + note.step * step_seconds) * sample_rate)
+            if note.step < start_step:
+                continue
+            start = int((body_offset + (note.step - start_step) * step_seconds) * sample_rate)
             duration = max(0.12, note.duration_steps * step_seconds * 0.88)
             sound = _pluck(midi_to_frequency(note.midi_note), duration, sample_rate)
             end = min(len(audio), start + len(sound))
@@ -173,6 +194,7 @@ class AudioEngine(QObject):
         assess: bool = False,
         include_notes: bool = True,
         count_in_beats: int = 4,
+        start_step: int = 0,
     ) -> None:
         if self.busy:
             return
@@ -180,7 +202,10 @@ class AudioEngine(QObject):
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._play_worker,
-            args=(exercise, bpm, output_device, input_device, assess, include_notes, count_in_beats),
+            args=(
+                exercise, bpm, output_device, input_device, assess, include_notes,
+                count_in_beats, start_step,
+            ),
             daemon=True,
         )
         self._thread.start()
@@ -194,6 +219,7 @@ class AudioEngine(QObject):
         assess: bool,
         include_notes: bool,
         count_in_beats: int,
+        start_step: int,
     ) -> None:
         import sounddevice as sd
 
@@ -244,7 +270,7 @@ class AudioEngine(QObject):
         try:
             audio = render_exercise(
                 exercise, bpm, count_in_beats=count_in_beats,
-                include_notes=include_notes, sample_rate=SAMPLE_RATE,
+                include_notes=include_notes, sample_rate=SAMPLE_RATE, start_step=start_step,
             )
             if assess:
                 stream = sd.InputStream(
@@ -259,10 +285,15 @@ class AudioEngine(QObject):
             sd.play(audio, samplerate=SAMPLE_RATE, device=output_device, blocking=False)
             step_seconds = 60.0 / bpm / exercise.steps_per_beat
             body_start = count_in_beats * 60.0 / bpm
+            end_step = playback_end_step(exercise, start_step) or start_step
             last_step = -2
             while sd.get_stream().active and not self._stop.is_set():
                 elapsed = time.monotonic() - started
-                step = -1 if elapsed < body_start else int((elapsed - body_start) / step_seconds)
+                step = (
+                    -1
+                    if elapsed < body_start
+                    else min(end_step - 1, start_step + int((elapsed - body_start) / step_seconds))
+                )
                 if step != last_step:
                     self.position_changed.emit(step)
                     last_step = step

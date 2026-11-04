@@ -177,7 +177,7 @@ def test_ctrl_z_reaches_tab_history_from_unchanged_cell_editor() -> None:
     application.processEvents()
 
 
-def test_copy_and_paste_selected_rectangle_as_one_undo_step() -> None:
+def test_copy_and_paste_preserves_strings_regardless_of_paste_row() -> None:
     application = QApplication.instance() or QApplication([])
     grid = TabGrid()
     grid.item(1, 2).setText("5h")
@@ -191,22 +191,49 @@ def test_copy_and_paste_selected_rectangle_as_one_undo_step() -> None:
     grid.keyPressEvent(QKeyEvent(
         QEvent.Type.KeyPress, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier,
     ))
-    grid.setCurrentCell(3, 6)
+    for paste_row in (0, 5):
+        grid.setCurrentCell(paste_row, 6)
+        grid.keyPressEvent(QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
+        ))
+
+        assert grid.item(1, 6).text() == "5h"
+        assert grid.item(1, 7).text() == "7"
+        assert grid.item(2, 6).text() == "9"
+        assert grid.item(2, 7).text() == ""
+        assert grid.item(paste_row, 6).text() == ("" if paste_row != 1 else "5h")
+
+        grid.undo_edit()
+
+        assert grid.item(1, 6).text() == ""
+        assert grid.item(1, 7).text() == ""
+        assert grid.item(2, 6).text() == ""
+    QApplication.clipboard().clear()
+    grid.close()
+    application.processEvents()
+
+
+def test_ctrl_x_cuts_selection_and_can_be_undone() -> None:
+    application = QApplication.instance() or QApplication([])
+    grid = TabGrid()
+    grid.item(1, 2).setText("5h")
+    grid.item(2, 2).setText("9")
+    grid.clearSelection()
+    grid.item(1, 2).setSelected(True)
+    grid.item(2, 2).setSelected(True)
 
     grid.keyPressEvent(QKeyEvent(
-        QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier,
+        QEvent.Type.KeyPress, Qt.Key.Key_X, Qt.KeyboardModifier.ControlModifier,
     ))
 
-    assert grid.item(3, 6).text() == "5h"
-    assert grid.item(3, 7).text() == "7"
-    assert grid.item(4, 6).text() == "9"
-    assert grid.item(4, 7).text() == ""
+    assert grid.item(1, 2).text() == ""
+    assert grid.item(2, 2).text() == ""
+    assert QApplication.clipboard().text() == "5h\n9"
 
     grid.undo_edit()
 
-    assert grid.item(3, 6).text() == ""
-    assert grid.item(3, 7).text() == ""
-    assert grid.item(4, 6).text() == ""
+    assert grid.item(1, 2).text() == "5h"
+    assert grid.item(2, 2).text() == "9"
     QApplication.clipboard().clear()
     grid.close()
     application.processEvents()
@@ -289,6 +316,7 @@ def test_staff_uses_same_pixel_timeline_as_tab() -> None:
     staff.set_timeline_view(scroll_offset=76, pixels_per_step=38, left=31)
 
     assert staff._step_x(2) == 50.0
+    assert staff._step_boundary_x(2) == 31.0
     staff.close()
     application.processEvents()
 
@@ -324,6 +352,58 @@ def test_editor_offers_triplet_subdivisions(tmp_path) -> None:
     assert values == [1, 2, 3, 4, 6]
     assert labels == ["4分音符", "8分音符", "12分音符", "16分音符", "24分音符"]
     assert page.subdivision.currentData() == 4
+    page.close()
+    storage.close()
+    application.processEvents()
+
+
+def test_editor_allows_up_to_256_bars_without_resizing_during_typing(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    storage = Storage(tmp_path / "bar_count.db")
+    page = EditorPage(storage)
+
+    assert page.bars.minimum() == 1
+    assert page.bars.maximum() == 256
+    assert not page.bars.keyboardTracking()
+    assert page.bars.isAccelerated()
+    assert "256" in page.bars.toolTip()
+
+    page.bars.setValue(256)
+
+    assert page.grid.columnCount() == 256 * 4 * page.subdivision.currentData()
+    assert page.build_exercise().bars == 256
+
+    page.close()
+    storage.close()
+    application.processEvents()
+
+
+def test_editor_can_preview_from_start_or_cursor_and_stop(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    storage = Storage(tmp_path / "editor_preview.db")
+    page = EditorPage(storage)
+    previews = []
+    stops = []
+    page.preview_requested.connect(
+        lambda exercise, start_step: previews.append((exercise, start_step))
+    )
+    page.stop_requested.connect(lambda: stops.append(True))
+    page.grid.item(2, 9).setText("7")
+
+    page.play_from_start_button.click()
+    page.grid.setCurrentCell(5, 6)
+    page.play_from_cursor_button.click()
+
+    assert [start_step for _, start_step in previews] == [0, 6]
+    assert previews[1][0].notes[0].step == 9
+
+    page.set_running(True)
+    assert not page.play_from_start_button.isEnabled()
+    assert not page.play_from_cursor_button.isEnabled()
+    assert page.stop_button.isEnabled()
+    page.stop_button.click()
+    assert stops == [True]
+
     page.close()
     storage.close()
     application.processEvents()
