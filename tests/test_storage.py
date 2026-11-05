@@ -6,13 +6,25 @@ from gt_trainer.storage import Storage
 
 def test_exercise_round_trip(tmp_path) -> None:
     storage = Storage(tmp_path / "test.db")
-    exercise = storage.save_exercise(Exercise(name="test", notes=[TabNote(2, 5, 3, technique="h")]))
+    exercise = storage.save_exercise(Exercise(
+        name="test", key_root=9, notes=[TabNote(2, 5, 3, technique="h")],
+    ))
     loaded = storage.get_exercise(exercise.id)
     assert loaded is not None
     assert loaded.name == "test"
     assert loaded.notes[0].midi_note == 43
     assert loaded.notes[0].technique == "h"
+    assert loaded.key_root == 9
     storage.close()
+
+
+def test_legacy_exercise_without_key_remains_compatible() -> None:
+    exercise = Exercise.from_dict({
+        "name": "legacy",
+        "notes": [{"step": 0, "string": 5, "fret": 0}],
+    })
+
+    assert exercise.key_root is None
 
 
 def test_practice_menu_round_trip_preserves_duplicates_and_bpms(tmp_path) -> None:

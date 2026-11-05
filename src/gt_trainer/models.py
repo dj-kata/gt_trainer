@@ -45,6 +45,7 @@ class Exercise:
     steps_per_beat: int = 4
     beats_per_bar: int = 4
     bars: int = 1
+    key_root: int | None = None
     notes: list[TabNote] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 

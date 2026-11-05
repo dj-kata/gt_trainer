@@ -151,6 +151,11 @@ class MainWindow(QMainWindow):
         main.addLayout(content, 1)
 
         self.practice.start_menu_requested.connect(self.start_practice_menu)
+        self.practice.preview_item_requested.connect(
+            lambda exercise, bpm: self.start_practice(
+                exercise, False, 0, bpm_override=bpm,
+            )
+        )
         self.practice.stop_requested.connect(self._stop_practice)
         self.practice.edit_requested.connect(self.edit_exercise)
         self.editor.saved.connect(self._exercise_saved)
@@ -285,7 +290,14 @@ class MainWindow(QMainWindow):
         if self.active_calibration:
             self.audio.stop()
 
-    def start_practice(self, exercise: Exercise, assess: bool, start_step: int = 0) -> None:
+    def start_practice(
+        self,
+        exercise: Exercise,
+        assess: bool,
+        start_step: int = 0,
+        *,
+        bpm_override: int | None = None,
+    ) -> None:
         if self.audio.busy:
             return
         self._reset_menu_state()
@@ -302,7 +314,7 @@ class MainWindow(QMainWindow):
         self.editor.set_running(True)
         self._play_exercise(
             exercise,
-            self.bpm.value(),
+            self.bpm.value() if bpm_override is None else bpm_override,
             assess,
             count_in_beats=exercise.beats_per_bar,
             start_step=start_step,
@@ -321,7 +333,7 @@ class MainWindow(QMainWindow):
         self.active_assessment = assess
         self.active_bpm = bpm
         self.active_count_in_beats = count_in_beats
-        self.practice.show_exercise(exercise)
+        self.practice.show_exercise(exercise, bpm, context="再生中")
         self.practice.prepare_staff(exercise, bpm, count_in_beats)
         # During assessment, the guide notes are muted so they cannot leak into pitch detection.
         self.audio.play(
@@ -389,6 +401,7 @@ class MainWindow(QMainWindow):
         self.practice.set_menu_progress(
             next_index, len(self.active_menu_items), exercise.name, bpm, interval=True,
         )
+        self.practice.show_exercise(exercise, bpm, context="次に再生")
         self.audio.play_interval(
             bpm, exercise.beats_per_bar, self.output_device.currentData()
         )
@@ -446,6 +459,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self._restart_input_monitor)
         self.practice.set_running(False)
         self.editor.set_running(False)
+        self.practice.show_selected_exercise()
         if cancelled or not self.active_assessment or not self.active_exercise:
             return
         attempts, total = self._save_active_assessment(observations)
@@ -483,6 +497,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self._restart_input_monitor)
         self.practice.set_running(False)
         self.editor.set_running(False)
+        self.practice.show_selected_exercise()
         if not cancelled and self.active_menu_assessment and self.active_menu_attempts:
             pitch, timing, total = score_attempts(self.active_menu_attempts)
             details = "\n".join(

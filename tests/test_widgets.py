@@ -408,6 +408,31 @@ def test_fretboard_highlights_all_notes_at_playhead() -> None:
     application.processEvents()
 
 
+def test_fretboard_marks_major_root_third_and_fifth_across_all_positions() -> None:
+    application = QApplication.instance() or QApplication([])
+    fretboard = FretboardWidget()
+    fretboard.set_exercise(Exercise(
+        key_root=9,
+        notes=[TabNote(step=0, string=5, fret=6)],
+    ))
+    fretboard.resize(1000, 160)
+    fretboard.show()
+    application.processEvents()
+
+    markers = fretboard.display_markers()
+
+    assert markers[(5, 5)] == ("A", 1)
+    assert markers[(5, 9)] == ("C#", 3)
+    assert markers[(5, 12)] == ("E", 5)
+    assert markers[(5, 6)] == ("A#", None)
+    assert fretboard.marker_emphasis(5, 5) == "reference"
+    assert fretboard.marker_emphasis(5, 6) == "score"
+    fretboard.set_playhead(0)
+    assert fretboard.marker_emphasis(5, 6) == "active"
+    fretboard.close()
+    application.processEvents()
+
+
 def test_playhead_scroll_pages_at_bar_boundaries() -> None:
     application = QApplication.instance() or QApplication([])
     grid = TabGrid()
@@ -472,6 +497,36 @@ def test_editor_offers_triplet_subdivisions(tmp_path) -> None:
     application.processEvents()
 
 
+def test_editor_lists_saved_exercises_and_loads_selected_score(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    storage = Storage(tmp_path / "editor_list.db")
+    first = storage.save_exercise(Exercise(
+        name="譜面A", key_root=0, notes=[TabNote(step=2, string=5, fret=3)],
+    ))
+    second = storage.save_exercise(Exercise(
+        name="譜面B", key_root=9, notes=[TabNote(step=7, string=2, fret=5)],
+    ))
+    page = EditorPage(storage)
+
+    assert page.exercise_selector.count() == 3
+    assert page.exercise_selector.itemData(0) is None
+    page.exercise_selector.setCurrentIndex(page.exercise_selector.findData(second.id))
+
+    assert page.exercise_id == second.id
+    assert page.name.text() == "譜面B"
+    assert page.key_root.currentData() == 9
+    assert [(note.step, note.string, note.fret) for note in page.grid.notes()] == [
+        (7, 2, 5),
+    ]
+
+    page.exercise_selector.setCurrentIndex(0)
+    assert page.exercise_id is None
+    assert page.name.text() == "新しい練習"
+    page.close()
+    storage.close()
+    application.processEvents()
+
+
 def test_editor_allows_up_to_256_bars_without_resizing_during_typing(tmp_path) -> None:
     application = QApplication.instance() or QApplication([])
     storage = Storage(tmp_path / "bar_count.db")
@@ -505,10 +560,12 @@ def test_editor_can_preview_from_start_or_cursor_and_stop(tmp_path) -> None:
     page.stop_requested.connect(lambda: stops.append(True))
     page.grid.item(2, 9).setText("7")
     page.grid.item(2, 15).setText("9")
+    page.key_root.setCurrentIndex(page.key_root.findData(9))
     page.set_bpm(60)
 
     assert "0:04.0" in page.duration_label.text()
     assert "60 BPM" in page.duration_label.text()
+    assert page.build_exercise().key_root == 9
 
     page.play_from_start_button.click()
     page.grid.setCurrentCell(5, 6)
@@ -565,10 +622,23 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
     )
     page.practice_button.click()
     assert page.practice_tabs.currentIndex() == 1
+    assert page.play_button.text() == "▶  メニュー全体を再生"
+    assert page.practice_button.text() == "●  メニュー全体を採点"
+    assert page.preview_title_label.text() == "選択中: 譜面A / 70 BPM"
     assert [(item.exercise_id, item.bpm) for item in requested[0][0].items] == [
         (exercise.id, 60), (exercise.id, 70),
     ]
     assert requested[0][1]
+    item_previews = []
+    page.preview_item_requested.connect(
+        lambda selected_exercise, bpm: item_previews.append((selected_exercise.id, bpm))
+    )
+    page.preview_item_button.click()
+    assert item_previews == [(exercise.id, 70)]
+    page.show_exercise(Exercise(name="再生で一時表示", notes=[]), 120, context="再生中")
+    assert page.preview_title_label.text() == "再生中: 再生で一時表示 / 120 BPM"
+    page.show_selected_exercise()
+    assert page.preview_title_label.text() == "選択中: 譜面A / 70 BPM"
     page.close()
     storage.close()
     application.processEvents()
