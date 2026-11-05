@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from PySide6.QtCore import QEvent, QRect, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
@@ -12,10 +14,16 @@ from PySide6.QtWidgets import (
 
 from gt_trainer.staff import StaffWidget
 from gt_trainer.fretboard import FretboardWidget
-from gt_trainer.models import Exercise, PracticeMenuItem, TabNote
+from gt_trainer.models import Exercise, PracticeMenuItem, SessionResult, TabNote
 from gt_trainer.storage import Storage
 from gt_trainer.music import calibration_exercise
-from gt_trainer.widgets import CalibrationDialog, EditorPage, PracticePage, TabGrid
+from gt_trainer.widgets import (
+    CalibrationDialog,
+    EditorPage,
+    PracticePage,
+    ProgressPage,
+    TabGrid,
+)
 
 
 def test_calibration_dialog_prompts_open_strings_in_order() -> None:
@@ -642,6 +650,66 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
     assert page.preview_title_label.text() == "再生中: 再生で一時表示 / 120 BPM"
     page.show_selected_exercise()
     assert page.preview_title_label.text() == "選択中: 譜面A / 70 BPM"
+    page.close()
+    storage.close()
+    application.processEvents()
+
+
+def test_progress_report_separates_conditions_and_compares_completed_menu_runs(
+    tmp_path,
+) -> None:
+    application = QApplication.instance() or QApplication([])
+    storage = Storage(tmp_path / "progress.db")
+    exercise = storage.save_exercise(Exercise(name="譜面A"))
+
+    def save(
+        bpm: int,
+        score: float,
+        started_at: str,
+        *,
+        run_id: str | None = None,
+        item_index: int | None = None,
+    ) -> None:
+        storage.save_session(SessionResult(
+            exercise_id=exercise.id,
+            exercise_name=exercise.name,
+            bpm=bpm,
+            started_at=started_at,
+            pitch_score=score,
+            timing_score=score,
+            total_score=score,
+            attempts=[],
+            menu_run_id=run_id,
+            menu_name="基礎" if run_id else None,
+            menu_item_index=item_index,
+        ))
+
+    first_run = storage.start_practice_menu_run(1, "基礎", "2026-01-01T10:00:00")
+    save(60, 50, "2026-01-01T10:01:00", run_id=first_run, item_index=0)
+    save(70, 40, "2026-01-01T10:02:00", run_id=first_run, item_index=1)
+    storage.complete_practice_menu_run(first_run, "2026-01-01T10:03:00")
+    second_run = storage.start_practice_menu_run(1, "基礎", "2026-01-02T10:00:00")
+    save(60, 70, "2026-01-02T10:01:00", run_id=second_run, item_index=0)
+    save(70, 80, "2026-01-02T10:02:00", run_id=second_run, item_index=1)
+    storage.complete_practice_menu_run(second_run, "2026-01-02T10:03:00")
+    page = ProgressPage(storage)
+
+    assert page.condition_combo.count() == 2
+    page.condition_combo.setCurrentIndex(
+        page.condition_combo.findData(
+            json.dumps([exercise.id, exercise.name, 60], ensure_ascii=False)
+        )
+    )
+    assert page.history.rowCount() == 2
+    assert all(
+        page.history.item(row, 2).text() == "60"
+        for row in range(page.history.rowCount())
+    )
+    assert "譜面A / 60 BPM" in page.summary.text()
+    assert "完了 2回" in page.menu_summary.text()
+    assert page.correlation_table.rowCount() == 2
+    assert page.correlation_table.item(0, 1).text() == "+1.00"
+
     page.close()
     storage.close()
     application.processEvents()

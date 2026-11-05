@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 
 from .models import Exercise, NoteAttempt, PracticeMenu, SessionResult
@@ -45,7 +46,26 @@ class Storage:
                 data TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS practice_menu_runs (
+                id TEXT PRIMARY KEY,
+                menu_id INTEGER,
+                menu_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT
+            );
         """)
+        session_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(sessions)")
+        }
+        for name, column_type in (
+            ("menu_run_id", "TEXT"),
+            ("menu_name", "TEXT"),
+            ("menu_item_index", "INTEGER"),
+        ):
+            if name not in session_columns:
+                self.connection.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {name} {column_type}"
+                )
         self.connection.commit()
 
     def save_exercise(self, exercise: Exercise) -> Exercise:
@@ -118,18 +138,92 @@ class Storage:
         self.connection.execute(
             """INSERT INTO sessions(
                 exercise_id, exercise_name, bpm, started_at,
-                pitch_score, timing_score, total_score, attempts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                pitch_score, timing_score, total_score, attempts,
+                menu_run_id, menu_name, menu_item_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (result.exercise_id, result.exercise_name, result.bpm, result.started_at,
-             result.pitch_score, result.timing_score, result.total_score, attempts),
+             result.pitch_score, result.timing_score, result.total_score, attempts,
+             result.menu_run_id, result.menu_name, result.menu_item_index),
         )
         self.connection.commit()
 
-    def list_sessions(self, exercise_id: int | None = None) -> list[sqlite3.Row]:
-        if exercise_id is None:
+    def list_sessions(
+        self,
+        exercise_id: int | None = None,
+        bpm: int | None = None,
+        *,
+        exercise_name: str | None = None,
+    ) -> list[sqlite3.Row]:
+        if exercise_id is None and bpm is None:
             return list(self.connection.execute("SELECT * FROM sessions ORDER BY started_at"))
+        if exercise_id is None:
+            if exercise_name is not None:
+                return list(self.connection.execute(
+                    """SELECT * FROM sessions
+                       WHERE exercise_id IS NULL AND exercise_name=? AND bpm=?
+                       ORDER BY started_at, id""",
+                    (exercise_name, bpm),
+                ))
+            return list(self.connection.execute(
+                "SELECT * FROM sessions WHERE exercise_id IS NULL AND bpm=? ORDER BY started_at, id",
+                (bpm,),
+            ))
+        if bpm is not None:
+            return list(self.connection.execute(
+                """SELECT * FROM sessions
+                   WHERE exercise_id=? AND bpm=? ORDER BY started_at, id""",
+                (exercise_id, bpm),
+            ))
         return list(self.connection.execute(
-            "SELECT * FROM sessions WHERE exercise_id=? ORDER BY started_at", (exercise_id,)
+            "SELECT * FROM sessions WHERE exercise_id=? ORDER BY started_at, id", (exercise_id,)
+        ))
+
+    def list_session_conditions(self) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            """SELECT exercise_id, exercise_name, bpm, COUNT(*) AS session_count,
+                      MAX(started_at) AS latest_at
+               FROM sessions
+               GROUP BY exercise_id,
+                        CASE WHEN exercise_id IS NULL THEN exercise_name ELSE '' END,
+                        bpm
+               ORDER BY latest_at DESC"""
+        ))
+
+    def start_practice_menu_run(
+        self, menu_id: int | None, menu_name: str, started_at: str,
+    ) -> str:
+        run_id = uuid.uuid4().hex
+        self.connection.execute(
+            """INSERT INTO practice_menu_runs(id, menu_id, menu_name, started_at)
+               VALUES (?, ?, ?, ?)""",
+            (run_id, menu_id, menu_name, started_at),
+        )
+        self.connection.commit()
+        return run_id
+
+    def complete_practice_menu_run(self, run_id: str, completed_at: str) -> None:
+        self.connection.execute(
+            "UPDATE practice_menu_runs SET completed_at=? WHERE id=?",
+            (completed_at, run_id),
+        )
+        self.connection.commit()
+
+    def list_completed_menu_names(self) -> list[str]:
+        return [row["menu_name"] for row in self.connection.execute(
+            """SELECT menu_name, MAX(completed_at) AS latest
+               FROM practice_menu_runs
+               WHERE completed_at IS NOT NULL
+               GROUP BY menu_name ORDER BY latest DESC"""
+        )]
+
+    def list_completed_menu_sessions(self, menu_name: str) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            """SELECT s.*, r.started_at AS run_started_at
+               FROM practice_menu_runs r
+               JOIN sessions s ON s.menu_run_id = r.id
+               WHERE r.menu_name=? AND r.completed_at IS NOT NULL
+               ORDER BY r.started_at, r.id, s.menu_item_index""",
+            (menu_name,),
         ))
 
     def close(self) -> None:

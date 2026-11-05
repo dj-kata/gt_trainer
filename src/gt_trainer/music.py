@@ -43,6 +43,28 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}:{remainder:04.1f}"
 
 
+def pearson_correlation(
+    left: list[float], right: list[float],
+) -> float | None:
+    """Return Pearson's r, or None when the shared values cannot be compared."""
+    if len(left) != len(right) or len(left) < 2:
+        return None
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    left_delta = [value - left_mean for value in left]
+    right_delta = [value - right_mean for value in right]
+    denominator = math.sqrt(
+        sum(value * value for value in left_delta)
+        * sum(value * value for value in right_delta)
+    )
+    if denominator == 0:
+        return None
+    return sum(
+        left_value * right_value
+        for left_value, right_value in zip(left_delta, right_delta)
+    ) / denominator
+
+
 @dataclass(slots=True)
 class PitchObservation:
     time: float

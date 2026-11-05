@@ -107,4 +107,7 @@ class SessionResult:
     timing_score: float
     total_score: float
     attempts: list[NoteAttempt]
+    menu_run_id: str | None = None
+    menu_name: str | None = None
+    menu_item_index: int | None = None
 

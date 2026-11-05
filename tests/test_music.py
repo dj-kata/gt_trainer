@@ -25,6 +25,7 @@ from gt_trainer.music import (
     format_duration,
     frequency_to_midi,
     midi_to_frequency,
+    pearson_correlation,
     score_attempts,
 )
 
@@ -44,6 +45,13 @@ def test_exercise_duration_uses_bpm_and_last_note_end() -> None:
     assert exercise_duration_seconds(exercise, 60) == pytest.approx(4.0)
     assert exercise_duration_seconds(exercise, 120) == pytest.approx(2.0)
     assert format_duration(64.25) == "1:04.2"
+
+
+def test_pearson_correlation_compares_shared_run_scores() -> None:
+    assert pearson_correlation([40, 60, 80], [50, 70, 90]) == pytest.approx(1.0)
+    assert pearson_correlation([40, 60, 80], [90, 70, 50]) == pytest.approx(-1.0)
+    assert pearson_correlation([50], [60]) is None
+    assert pearson_correlation([50, 50], [60, 70]) is None
 
 
 @pytest.mark.parametrize(

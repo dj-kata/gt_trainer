@@ -50,6 +50,8 @@ class MainWindow(QMainWindow):
         self.active_menu_phase: str | None = None
         self.active_menu_attempts = []
         self.active_menu_details: list[tuple[str, int, float]] = []
+        self.active_menu_id: int | None = None
+        self.active_menu_run_id: str | None = None
         self._menu_cancelled = False
         self.active_calibration = False
         self.calibration_dialog: CalibrationDialog | None = None
@@ -363,11 +365,19 @@ class MainWindow(QMainWindow):
         self.active_menu_items = items
         self.active_menu_index = 0
         self.active_menu_name = menu.name
+        self.active_menu_id = menu.id
         self.active_menu_assessment = assess
         self.active_menu_phase = "exercise"
         self.active_menu_attempts = []
         self.active_menu_details = []
         self._menu_cancelled = False
+        self.active_menu_run_id = (
+            self.storage.start_practice_menu_run(
+                menu.id, menu.name, datetime.now().isoformat(timespec="seconds")
+            )
+            if assess
+            else None
+        )
         self.practice.set_running(True, assess)
         self.editor.set_running(True)
         self._start_menu_item(0)
@@ -488,6 +498,11 @@ class MainWindow(QMainWindow):
             timing_score=timing,
             total_score=total,
             attempts=attempts,
+            menu_run_id=self.active_menu_run_id,
+            menu_name=self.active_menu_name if self.active_menu_run_id else None,
+            menu_item_index=(
+                self.active_menu_index if self.active_menu_run_id else None
+            ),
         )
         self.storage.save_session(result)
         self.progress.reload()
@@ -498,6 +513,16 @@ class MainWindow(QMainWindow):
         self.practice.set_running(False)
         self.editor.set_running(False)
         self.practice.show_selected_exercise()
+        if (
+            not cancelled
+            and self.active_menu_assessment
+            and self.active_menu_run_id is not None
+        ):
+            self.storage.complete_practice_menu_run(
+                self.active_menu_run_id,
+                datetime.now().isoformat(timespec="seconds"),
+            )
+            self.progress.reload()
         if not cancelled and self.active_menu_assessment and self.active_menu_attempts:
             pitch, timing, total = score_attempts(self.active_menu_attempts)
             details = "\n".join(
@@ -519,6 +544,8 @@ class MainWindow(QMainWindow):
         self.active_menu_items = []
         self.active_menu_index = -1
         self.active_menu_name = ""
+        self.active_menu_id = None
+        self.active_menu_run_id = None
         self.active_menu_assessment = False
         self.active_menu_phase = None
         self.active_menu_attempts = []

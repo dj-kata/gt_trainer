@@ -37,7 +37,7 @@ from .models import (
     parse_tab_cell,
 )
 from .fretboard import FretboardWidget
-from .music import exercise_duration_seconds, format_duration
+from .music import exercise_duration_seconds, format_duration, pearson_correlation
 from .staff import StaffWidget
 from .storage import Storage
 
@@ -1319,35 +1319,124 @@ class ProgressPage(QWidget):
         title.setObjectName("pageTitle")
         root.addWidget(title)
 
+        self.report_tabs = QTabWidget()
+        root.addWidget(self.report_tabs, 1)
+
+        condition_page = QWidget()
+        condition_layout = QVBoxLayout(condition_page)
+        condition_layout.setContentsMargins(8, 12, 8, 8)
+        condition_filter = QHBoxLayout()
+        condition_filter.addWidget(QLabel("比較する譜面・BPM"))
+        self.condition_combo = QComboBox()
+        self.condition_combo.setMinimumWidth(320)
+        condition_filter.addWidget(self.condition_combo, 1)
+        condition_layout.addLayout(condition_filter)
+
         self.summary = QLabel("まだ採点結果がありません")
         self.summary.setObjectName("summaryCard")
         self.summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(self.summary)
+        condition_layout.addWidget(self.summary)
 
         self.chart = pg.PlotWidget()
-        self.chart.setBackground("#111722")
-        self.chart.showGrid(x=True, y=True, alpha=0.16)
-        self.chart.setYRange(0, 100)
-        self.chart.setLabel("left", "スコア")
-        self.chart.setLabel("bottom", "練習回")
-        self.chart.addLegend()
-        root.addWidget(self.chart, 1)
+        self._configure_chart(self.chart, "同じ条件での練習回")
+        condition_layout.addWidget(self.chart, 1)
 
         self.history = QTableWidget(0, 5)
         self.history.setHorizontalHeaderLabels(("日時", "練習", "BPM", "音程", "リズム"))
         self.history.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history.setMaximumHeight(220)
-        root.addWidget(self.history)
+        condition_layout.addWidget(self.history)
+        self.report_tabs.addTab(condition_page, "譜面・BPM別")
+
+        menu_page = QWidget()
+        menu_layout = QVBoxLayout(menu_page)
+        menu_layout.setContentsMargins(8, 12, 8, 8)
+        menu_filter = QHBoxLayout()
+        menu_filter.addWidget(QLabel("比較する練習メニュー"))
+        self.menu_report_combo = QComboBox()
+        self.menu_report_combo.setMinimumWidth(320)
+        menu_filter.addWidget(self.menu_report_combo, 1)
+        menu_layout.addLayout(menu_filter)
+        self.menu_summary = QLabel("完了したメニュー採点がありません")
+        self.menu_summary.setObjectName("summaryCard")
+        self.menu_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        menu_layout.addWidget(self.menu_summary)
+        self.menu_chart = pg.PlotWidget()
+        self._configure_chart(self.menu_chart, "メニューを通した回")
+        menu_layout.addWidget(self.menu_chart, 1)
+        correlation_help = QLabel(
+            "項目間の相関（同じ通し回での総合スコア。+1に近いほど一緒に伸び、-1に近いほど逆に動きます）"
+        )
+        correlation_help.setWordWrap(True)
+        menu_layout.addWidget(correlation_help)
+        self.correlation_table = QTableWidget(0, 0)
+        self.correlation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.correlation_table.setMaximumHeight(240)
+        menu_layout.addWidget(self.correlation_table)
+        self.report_tabs.addTab(menu_page, "メニュー通し")
+
+        self.condition_combo.currentIndexChanged.connect(
+            self._reload_condition_report
+        )
+        self.menu_report_combo.currentIndexChanged.connect(
+            self._reload_menu_report
+        )
         self.reload()
 
+    @staticmethod
+    def _configure_chart(chart: pg.PlotWidget, bottom_label: str) -> None:
+        chart.setBackground("#111722")
+        chart.showGrid(x=True, y=True, alpha=0.16)
+        chart.setYRange(0, 100)
+        chart.setLabel("left", "スコア")
+        chart.setLabel("bottom", bottom_label)
+        chart.addLegend()
+
     def reload(self) -> None:
-        sessions = self.storage.list_sessions()
+        selected_condition = self.condition_combo.currentData()
+        self.condition_combo.blockSignals(True)
+        self.condition_combo.clear()
+        for condition in self.storage.list_session_conditions():
+            data = json.dumps([
+                condition["exercise_id"], condition["exercise_name"], condition["bpm"],
+            ], ensure_ascii=False)
+            self.condition_combo.addItem(
+                f"{condition['exercise_name']} / {condition['bpm']} BPM"
+                f"（{condition['session_count']}回）",
+                data,
+            )
+        condition_index = self.condition_combo.findData(selected_condition)
+        self.condition_combo.setCurrentIndex(
+            condition_index if condition_index >= 0 else (0 if self.condition_combo.count() else -1)
+        )
+        self.condition_combo.blockSignals(False)
+        self._reload_condition_report()
+
+        selected_menu = self.menu_report_combo.currentData()
+        self.menu_report_combo.blockSignals(True)
+        self.menu_report_combo.clear()
+        for menu_name in self.storage.list_completed_menu_names():
+            self.menu_report_combo.addItem(menu_name, menu_name)
+        menu_index = self.menu_report_combo.findData(selected_menu)
+        self.menu_report_combo.setCurrentIndex(
+            menu_index if menu_index >= 0 else (0 if self.menu_report_combo.count() else -1)
+        )
+        self.menu_report_combo.blockSignals(False)
+        self._reload_menu_report()
+
+    def _reload_condition_report(self, *args) -> None:  # noqa: ANN002
         self.chart.clear()
-        self.history.setRowCount(len(sessions))
-        if not sessions:
+        condition = self.condition_combo.currentData()
+        if condition is None:
+            self.history.setRowCount(0)
             self.summary.setText("採点をすると、ここに成長の推移が表示されます")
             return
+        exercise_id, exercise_name, bpm = json.loads(condition)
+        sessions = self.storage.list_sessions(
+            exercise_id, bpm, exercise_name=exercise_name,
+        )
+        self.history.setRowCount(len(sessions))
         x = list(range(1, len(sessions) + 1))
         pitch = [row["pitch_score"] for row in sessions]
         timing = [row["timing_score"] for row in sessions]
@@ -1357,7 +1446,7 @@ class ProgressPage(QWidget):
         self.chart.plot(x, timing, pen=pg.mkPen("#ffb35c", width=2), name="リズム")
         latest = sessions[-1]
         self.summary.setText(
-            f"最新スコア  {latest['total_score']:.0f}   ｜   "
+            f"{exercise_name} / {bpm} BPM　｜　最新スコア  {latest['total_score']:.0f}   ｜   "
             f"音程 {latest['pitch_score']:.0f}   リズム {latest['timing_score']:.0f}   ｜   練習 {len(sessions)}回"
         )
         for table_row, session in enumerate(reversed(sessions)):
@@ -1369,4 +1458,122 @@ class ProgressPage(QWidget):
                 item = QTableWidgetItem(value)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.history.setItem(table_row, column, item)
+
+    @staticmethod
+    def _weighted_run_score(rows: list) -> float:
+        weighted_total = 0.0
+        total_weight = 0
+        for row in rows:
+            try:
+                weight = max(1, len(json.loads(row["attempts"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                weight = 1
+            weighted_total += float(row["total_score"]) * weight
+            total_weight += weight
+        return weighted_total / total_weight if total_weight else 0.0
+
+    def _reload_menu_report(self, *args) -> None:  # noqa: ANN002
+        self.menu_chart.clear()
+        menu_name = self.menu_report_combo.currentData()
+        if menu_name is None:
+            self.menu_summary.setText("完了したメニュー採点がありません")
+            self.correlation_table.setRowCount(0)
+            self.correlation_table.setColumnCount(0)
+            return
+        sessions = self.storage.list_completed_menu_sessions(menu_name)
+        runs: dict[str, list] = {}
+        for session in sessions:
+            runs.setdefault(session["menu_run_id"], []).append(session)
+        if not runs:
+            self.menu_summary.setText("完了したメニュー採点がありません")
+            return
+
+        run_rows = list(runs.values())
+        x = list(range(1, len(run_rows) + 1))
+        overall = [self._weighted_run_score(rows) for rows in run_rows]
+        self.menu_chart.plot(
+            x, overall, pen=pg.mkPen("#63d7b5", width=3),
+            symbol="o", name="メニュー総合",
+        )
+
+        item_keys = sorted({
+            (
+                int(row["menu_item_index"]),
+                row["exercise_id"],
+                row["exercise_name"] if row["exercise_id"] is None else "",
+                int(row["bpm"]),
+            )
+            for rows in run_rows for row in rows
+            if row["menu_item_index"] is not None
+        }, key=lambda key: (
+            key[0],
+            f"id:{key[1]}" if key[1] is not None else f"name:{key[2]}",
+            key[3],
+        ))
+        item_labels: dict[tuple, str] = {}
+        score_by_item: dict[tuple, dict[int, float]] = {}
+        colors = ("#6ba7ff", "#ffb35c", "#c58cff", "#ef6b8a", "#8ed081", "#e8d45c")
+        for position, item_key in enumerate(item_keys):
+            item_index, exercise_id, exercise_name, bpm = item_key
+            points_x: list[int] = []
+            points_y: list[float] = []
+            score_by_item[item_key] = {}
+            for run_number, rows in enumerate(run_rows, start=1):
+                row = next(
+                    (candidate for candidate in rows
+                     if (
+                         candidate["menu_item_index"] == item_index
+                         and candidate["exercise_id"] == exercise_id
+                         and (exercise_id is not None or candidate["exercise_name"] == exercise_name)
+                         and candidate["bpm"] == bpm
+                     )),
+                    None,
+                )
+                if row is None:
+                    continue
+                item_labels.setdefault(
+                    item_key,
+                    f"{item_index + 1}. {row['exercise_name']} / {row['bpm']} BPM",
+                )
+                score = float(row["total_score"])
+                score_by_item[item_key][run_number] = score
+                points_x.append(run_number)
+                points_y.append(score)
+            if points_x:
+                self.menu_chart.plot(
+                    points_x, points_y,
+                    pen=pg.mkPen(colors[position % len(colors)], width=2),
+                    symbol="o", name=item_labels[item_key],
+                )
+
+        self.menu_summary.setText(
+            f"{menu_name}　｜　最新の通し総合 {overall[-1]:.0f}点　｜　完了 {len(run_rows)}回"
+        )
+        labels = [
+            item_labels.get(key, str(key[0] + 1))
+            for key in item_keys
+        ]
+        self.correlation_table.setRowCount(len(item_keys))
+        self.correlation_table.setColumnCount(len(item_keys))
+        self.correlation_table.setVerticalHeaderLabels(labels)
+        self.correlation_table.setHorizontalHeaderLabels(labels)
+        self.correlation_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        for row_number, left_key in enumerate(item_keys):
+            for column_number, right_key in enumerate(item_keys):
+                if left_key == right_key:
+                    value = "1.00"
+                else:
+                    shared_runs = sorted(
+                        set(score_by_item[left_key]) & set(score_by_item[right_key])
+                    )
+                    correlation = pearson_correlation(
+                        [score_by_item[left_key][run] for run in shared_runs],
+                        [score_by_item[right_key][run] for run in shared_runs],
+                    )
+                    value = "—" if correlation is None else f"{correlation:+.2f}"
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.correlation_table.setItem(row_number, column_number, item)
 
