@@ -10,6 +10,7 @@ from gt_trainer.audio import (
     playback_end_step,
     render_exercise,
     render_note_preview,
+    render_practice_interval,
     rms_to_level,
 )
 from gt_trainer.models import Exercise, TabNote, format_tab_cell, parse_tab_cell
@@ -19,7 +20,9 @@ from gt_trainer.music import (
     calibration_silent_click_steps,
     estimate_timing_calibration,
     evaluate_performance,
+    exercise_duration_seconds,
     expected_events,
+    format_duration,
     frequency_to_midi,
     midi_to_frequency,
     score_attempts,
@@ -30,6 +33,17 @@ def test_frequency_midi_round_trip() -> None:
     assert midi_to_frequency(69) == pytest.approx(440.0)
     assert frequency_to_midi(440.0) == pytest.approx(69.0)
     assert frequency_to_midi(midi_to_frequency(40)) == pytest.approx(40.0)
+
+
+def test_exercise_duration_uses_bpm_and_last_note_end() -> None:
+    exercise = Exercise(
+        steps_per_beat=4,
+        notes=[TabNote(step=15, string=5, fret=0, duration_steps=1)],
+    )
+
+    assert exercise_duration_seconds(exercise, 60) == pytest.approx(4.0)
+    assert exercise_duration_seconds(exercise, 120) == pytest.approx(2.0)
+    assert format_duration(64.25) == "1:04.2"
 
 
 @pytest.mark.parametrize(
@@ -65,6 +79,14 @@ def test_note_preview_renders_and_normalizes_a_chord() -> None:
     assert len(audio) == 1_600
     assert np.any(audio != 0)
     assert np.max(np.abs(audio)) <= 0.95
+
+
+def test_practice_interval_has_two_silent_bars_then_one_click_bar() -> None:
+    audio = render_practice_interval(60, 4, sample_rate=1_000)
+
+    assert len(audio) == 12_000
+    assert not np.any(audio[:8_000])
+    assert np.any(audio[8_000:12_000])
 
 
 def test_attack_tracker_keeps_attack_time_and_ignores_sustain() -> None:

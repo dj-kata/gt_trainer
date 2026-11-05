@@ -90,6 +90,27 @@ def render_note_preview(
     return audio
 
 
+def render_practice_interval(
+    bpm: int,
+    beats_per_bar: int,
+    *,
+    silent_bars: int = 2,
+    click_bars: int = 1,
+    sample_rate: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Render silent recovery bars followed by count-in click bars."""
+    beat_seconds = 60.0 / bpm
+    silent_beats = max(0, silent_bars) * beats_per_bar
+    total_beats = silent_beats + max(0, click_bars) * beats_per_bar
+    audio = np.zeros(max(1, int(total_beats * beat_seconds * sample_rate)), dtype=np.float32)
+    for beat in range(silent_beats, total_beats):
+        start = int(beat * beat_seconds * sample_rate)
+        sound = _click((beat - silent_beats) % beats_per_bar == 0, sample_rate)
+        end = min(len(audio), start + len(sound))
+        audio[start:end] += sound[:end - start]
+    return audio
+
+
 def playback_end_step(exercise: Exercise, start_step: int = 0) -> int | None:
     """Return the end of the last note that starts at or after start_step."""
     ends = [
@@ -424,6 +445,39 @@ class AudioEngine(QObject):
             sd.stop()
         except Exception:
             pass
+
+    def play_interval(
+        self,
+        bpm: int,
+        beats_per_bar: int,
+        output_device: int | None,
+    ) -> None:
+        """Play the two-bar rest and one-bar count-in between menu items."""
+        if self.busy:
+            return
+        self.stop_metronome()
+        self.stop_input_monitor()
+        self._stop.clear()
+
+        def worker() -> None:
+            import sounddevice as sd
+
+            failed = False
+            try:
+                audio = render_practice_interval(bpm, beats_per_bar)
+                sd.play(audio, samplerate=SAMPLE_RATE, device=output_device, blocking=False)
+                while sd.get_stream().active and not self._stop.wait(0.015):
+                    pass
+                sd.stop()
+            except Exception as exc:
+                failed = True
+                self.error.emit(str(exc))
+            finally:
+                self.position_changed.emit(-1)
+                self.playback_finished.emit([], self._stop.is_set() or failed)
+
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
 
     def preview_notes(self, midi_notes: list[int], output_device: int | None) -> None:
         """Play a short editor audition without blocking the GUI thread."""

@@ -20,13 +20,24 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QSpinBox,
     QStyledItemDelegate,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .models import Exercise, STRING_NAMES, TabNote, format_tab_cell, parse_tab_cell
+from .models import (
+    Exercise,
+    PracticeMenu,
+    PracticeMenuItem,
+    STRING_NAMES,
+    TabNote,
+    format_tab_cell,
+    parse_tab_cell,
+)
+from .fretboard import FretboardWidget
+from .music import exercise_duration_seconds, format_duration
 from .staff import StaffWidget
 from .storage import Storage
 
@@ -617,24 +628,15 @@ class TabGrid(QTableWidget):
                 if item:
                     item.setBackground(shade)
         if 0 <= step < self.columnCount():
-            self._scroll_playhead_ahead(step)
+            self._scroll_to_playhead_bar(step)
 
-    def _scroll_playhead_ahead(self, step: int) -> None:
-        """Keep the current step visible with up to one full bar ahead."""
-        header = self.horizontalHeader()
+    def _scroll_to_playhead_bar(self, step: int) -> None:
+        """Page the timeline at bar boundaries instead of scrolling every step."""
         steps_per_bar = max(1, self.steps_per_beat * self.beats_per_bar)
-        last_ahead = min(self.columnCount() - 1, step + steps_per_bar - 1)
-        current_left = header.sectionPosition(step)
-        ahead_right = (
-            header.sectionPosition(last_ahead) + header.sectionSize(last_ahead)
+        bar_start = step // steps_per_bar * steps_per_bar
+        self.horizontalScrollBar().setValue(
+            self.horizontalHeader().sectionPosition(bar_start)
         )
-        padding = 8
-        scroll_for_full_bar = ahead_right + padding - self.viewport().width()
-        scroll_keeping_cursor = current_left - padding
-        self.horizontalScrollBar().setValue(max(
-            0,
-            min(scroll_for_full_bar, scroll_keeping_cursor),
-        ))
 
 
 class EditorPage(QWidget):
@@ -646,6 +648,7 @@ class EditorPage(QWidget):
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
+        self.preview_bpm = 90
         self.exercise_id: int | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 24)
@@ -686,12 +689,17 @@ class EditorPage(QWidget):
         controls.addWidget(self.bars)
         controls.addWidget(QLabel("分割"))
         controls.addWidget(self.subdivision)
+        self.duration_label = QLabel()
+        self.duration_label.setObjectName("muted")
+        controls.addWidget(self.duration_label)
         root.addLayout(controls)
 
         self.grid = TabGrid()
         root.addWidget(self.grid)
         self.staff = StaffWidget()
         root.addWidget(self.staff)
+        self.fretboard = FretboardWidget()
+        root.addWidget(self.fretboard)
         self.grid.horizontalScrollBar().valueChanged.connect(self._sync_staff_timeline)
         self.grid.timeline_geometry_changed.connect(self._sync_staff_timeline)
         self.grid.audition_requested.connect(self.notes_audition_requested.emit)
@@ -736,7 +744,17 @@ class EditorPage(QWidget):
         self._update_staff()
 
     def _update_staff(self) -> None:
-        self.staff.set_exercise(self.build_exercise())
+        exercise = self.build_exercise()
+        self.staff.set_exercise(exercise)
+        self.fretboard.set_exercise(exercise)
+        self.duration_label.setText(
+            f"演奏時間 {format_duration(exercise_duration_seconds(exercise, self.preview_bpm))}"
+            f"（{self.preview_bpm} BPM）"
+        )
+
+    def set_bpm(self, bpm: int) -> None:
+        self.preview_bpm = bpm
+        self._update_staff()
 
     def _request_preview(self, start_step: int) -> None:
         self.preview_requested.emit(self.build_exercise(), start_step)
@@ -787,13 +805,14 @@ class EditorPage(QWidget):
 
 
 class PracticePage(QWidget):
-    start_requested = Signal(Exercise, bool)
+    start_menu_requested = Signal(object, bool)
     stop_requested = Signal()
     edit_requested = Signal(Exercise)
 
     def __init__(self, storage: Storage) -> None:
         super().__init__()
         self.storage = storage
+        self._status_context = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 24)
         root.setSpacing(16)
@@ -802,19 +821,91 @@ class PracticePage(QWidget):
         root.addWidget(title)
 
         selection, selection_layout = card("練習メニュー")
-        row = QHBoxLayout()
-        self.exercise_combo = QComboBox()
-        self.exercise_combo.currentIndexChanged.connect(self._selection_changed)
-        edit = QPushButton("TABを編集")
-        edit.clicked.connect(self._edit)
-        row.addWidget(self.exercise_combo, 1)
-        row.addWidget(edit)
-        selection_layout.addLayout(row)
+        self.practice_tabs = QTabWidget()
+        menu_editor = QWidget()
+        menu_layout = QVBoxLayout(menu_editor)
+        menu_layout.setContentsMargins(4, 6, 4, 4)
+        preview = QWidget()
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(4, 6, 4, 4)
+        menu_row = QHBoxLayout()
+        self.menu_combo = QComboBox()
+        self.menu_combo.currentIndexChanged.connect(self._menu_selected)
+        self.new_menu_button = QPushButton("新規")
+        self.new_menu_button.clicked.connect(self._new_menu)
+        self.menu_name = QLineEdit()
+        self.menu_name.setPlaceholderText("練習メニュー名")
+        self.save_menu_button = QPushButton("メニューを保存")
+        self.save_menu_button.clicked.connect(self._save_menu)
+        menu_row.addWidget(QLabel("メニュー"))
+        menu_row.addWidget(self.menu_combo, 1)
+        menu_row.addWidget(self.new_menu_button)
+        menu_row.addWidget(self.menu_name, 1)
+        menu_row.addWidget(self.save_menu_button)
+        menu_layout.addLayout(menu_row)
+
+        add_row = QHBoxLayout()
+        self.exercise_picker = QComboBox()
+        self.item_bpm = QSpinBox()
+        self.item_bpm.setRange(30, 240)
+        self.item_bpm.setValue(90)
+        self.item_bpm.setSuffix(" BPM")
+        self.add_item_button = QPushButton("＋ 追加")
+        self.add_item_button.clicked.connect(self._add_item)
+        add_row.addWidget(QLabel("譜面"))
+        add_row.addWidget(self.exercise_picker, 1)
+        add_row.addWidget(self.item_bpm)
+        add_row.addWidget(self.add_item_button)
+        menu_layout.addLayout(add_row)
+
+        self.menu_items = QTableWidget(0, 4)
+        self.menu_items.setHorizontalHeaderLabels(("順番", "譜面", "BPM", "演奏時間"))
+        self.menu_items.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.menu_items.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.menu_items.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.menu_items.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.menu_items.setColumnWidth(2, 112)
+        self.menu_items.setColumnWidth(3, 92)
+        self.menu_items.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.menu_items.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.menu_items.setMaximumHeight(132)
+        self.menu_items.itemSelectionChanged.connect(self._selection_changed)
+        menu_layout.addWidget(self.menu_items, 1)
+        self.menu_duration_label = QLabel()
+        self.menu_duration_label.setObjectName("muted")
+        self.menu_duration_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        menu_layout.addWidget(self.menu_duration_label)
+
+        order_row = QHBoxLayout()
+        self.move_up_button = QPushButton("↑ 上へ")
+        self.move_down_button = QPushButton("↓ 下へ")
+        self.remove_item_button = QPushButton("－ 削除")
+        self.move_up_button.clicked.connect(lambda: self._move_item(-1))
+        self.move_down_button.clicked.connect(lambda: self._move_item(1))
+        self.remove_item_button.clicked.connect(self._remove_item)
+        self.edit_item_button = QPushButton("TABを編集")
+        self.edit_item_button.clicked.connect(self._edit)
+        order_row.addWidget(self.move_up_button)
+        order_row.addWidget(self.move_down_button)
+        order_row.addWidget(self.remove_item_button)
+        order_row.addStretch()
+        order_row.addWidget(self.edit_item_button)
+        menu_layout.addLayout(order_row)
+
+        self.preview_duration_label = QLabel()
+        self.preview_duration_label.setObjectName("muted")
+        self.preview_duration_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        preview_layout.addWidget(self.preview_duration_label)
         self.preview_grid = TabGrid()
         self.preview_grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        selection_layout.addWidget(self.preview_grid)
+        preview_layout.addWidget(self.preview_grid)
         self.staff = StaffWidget()
-        selection_layout.addWidget(self.staff)
+        preview_layout.addWidget(self.staff)
+        self.fretboard = FretboardWidget()
+        preview_layout.addWidget(self.fretboard)
+        self.practice_tabs.addTab(menu_editor, "メニュー設定")
+        self.practice_tabs.addTab(preview, "譜面プレビュー")
+        selection_layout.addWidget(self.practice_tabs, 1)
         self.preview_grid.horizontalScrollBar().valueChanged.connect(self._sync_staff_timeline)
         self.preview_grid.timeline_geometry_changed.connect(self._sync_staff_timeline)
         root.addWidget(selection, 1)
@@ -849,33 +940,216 @@ class PracticePage(QWidget):
         )
 
     def reload(self) -> None:
-        current = self.exercise_combo.currentData()
-        self.exercise_combo.blockSignals(True)
-        self.exercise_combo.clear()
-        for exercise in self.storage.list_exercises():
-            self.exercise_combo.addItem(exercise.name, exercise.id)
-        if current is not None:
-            index = self.exercise_combo.findData(current)
-            self.exercise_combo.setCurrentIndex(max(0, index))
-        self.exercise_combo.blockSignals(False)
-        self._selection_changed()
+        current_menu_id = self.menu_combo.currentData()
+        exercises = self.storage.list_exercises()
+        self._exercises = {
+            exercise.id: exercise for exercise in exercises if exercise.id is not None
+        }
+        self.exercise_picker.clear()
+        for exercise in exercises:
+            self.exercise_picker.addItem(exercise.name, exercise.id)
+
+        menus = self.storage.list_practice_menus()
+        self.menu_combo.blockSignals(True)
+        self.menu_combo.clear()
+        for menu in menus:
+            self.menu_combo.addItem(menu.name, menu.id)
+        index = self.menu_combo.findData(current_menu_id)
+        self.menu_combo.setCurrentIndex(index if index >= 0 else (0 if menus else -1))
+        self.menu_combo.blockSignals(False)
+        if menus:
+            self._menu_selected()
+        else:
+            self._new_menu()
+
+    def _menu_selected(self, *args) -> None:  # noqa: ANN002
+        menu_id = self.menu_combo.currentData()
+        menu = self.storage.get_practice_menu(menu_id) if menu_id is not None else None
+        if menu is not None:
+            self._load_menu(menu)
+
+    def _new_menu(self) -> None:
+        self.menu_id: int | None = None
+        self.menu_combo.blockSignals(True)
+        self.menu_combo.setCurrentIndex(-1)
+        self.menu_combo.blockSignals(False)
+        self.menu_name.setText("新しい練習メニュー")
+        self._set_items([])
+        self.practice_tabs.setCurrentIndex(0)
+
+    def _load_menu(self, menu: PracticeMenu) -> None:
+        self.menu_id = menu.id
+        self.menu_name.setText(menu.name)
+        self._set_items(menu.items)
+
+    def _set_items(self, items: list[PracticeMenuItem], selected_row: int = 0) -> None:
+        self.menu_items.setRowCount(0)
+        for item in items:
+            self._append_item(item.exercise_id, item.bpm)
+        if self.menu_items.rowCount():
+            row = min(max(0, selected_row), self.menu_items.rowCount() - 1)
+            self.menu_items.selectRow(row)
+        else:
+            self._clear_preview()
+
+    def _append_item(self, exercise_id: int, bpm: int) -> None:
+        row = self.menu_items.rowCount()
+        self.menu_items.insertRow(row)
+        order = QTableWidgetItem(str(row + 1))
+        order.setFlags(order.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        exercise = self._exercises.get(exercise_id)
+        exercise_item = QTableWidgetItem(exercise.name if exercise else "（削除済みの譜面）")
+        exercise_item.setData(Qt.ItemDataRole.UserRole, exercise_id)
+        exercise_item.setFlags(exercise_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        bpm_item = QTableWidgetItem()
+        bpm_item.setFlags(bpm_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        bpm_editor = QSpinBox()
+        bpm_editor.setRange(30, 240)
+        bpm_editor.setValue(min(240, max(30, bpm)))
+        bpm_editor.setSuffix(" BPM")
+        bpm_editor.valueChanged.connect(self._update_menu_durations)
+        duration_item = QTableWidgetItem()
+        duration_item.setFlags(duration_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.menu_items.setItem(row, 0, order)
+        self.menu_items.setItem(row, 1, exercise_item)
+        self.menu_items.setItem(row, 2, bpm_item)
+        self.menu_items.setCellWidget(row, 2, bpm_editor)
+        self.menu_items.setItem(row, 3, duration_item)
+        self._update_menu_durations()
+
+    def _add_item(self) -> None:
+        exercise_id = self.exercise_picker.currentData()
+        if exercise_id is None:
+            QMessageBox.information(self, "譜面がありません", "先にTAB譜面を作成してください。")
+            return
+        self._append_item(exercise_id, self.item_bpm.value())
+        self.menu_items.selectRow(self.menu_items.rowCount() - 1)
+
+    def _remove_item(self) -> None:
+        row = self.menu_items.currentRow()
+        if row < 0:
+            return
+        self.menu_items.removeRow(row)
+        self._renumber_items()
+        if self.menu_items.rowCount():
+            self.menu_items.selectRow(min(row, self.menu_items.rowCount() - 1))
+        else:
+            self._clear_preview()
+        self._update_menu_durations()
+
+    def _move_item(self, delta: int) -> None:
+        row = self.menu_items.currentRow()
+        target = row + delta
+        if row < 0 or not 0 <= target < self.menu_items.rowCount():
+            return
+        items = self.build_menu().items
+        items[row], items[target] = items[target], items[row]
+        self._set_items(items, target)
+
+    def _renumber_items(self) -> None:
+        for row in range(self.menu_items.rowCount()):
+            self.menu_items.item(row, 0).setText(str(row + 1))
+
+    def _update_menu_durations(self, *args) -> None:  # noqa: ANN002
+        performance_total = 0.0
+        menu_total = 0.0
+        for row in range(self.menu_items.rowCount()):
+            exercise_id = self.menu_items.item(row, 1).data(Qt.ItemDataRole.UserRole)
+            exercise = self._exercises.get(exercise_id)
+            bpm_editor = self.menu_items.cellWidget(row, 2)
+            bpm = bpm_editor.value() if isinstance(bpm_editor, QSpinBox) else 90
+            seconds = exercise_duration_seconds(exercise, bpm) if exercise else 0.0
+            performance_total += seconds
+            menu_total += seconds
+            duration_item = self.menu_items.item(row, 3)
+            if duration_item is not None:
+                duration_item.setText(format_duration(seconds) if exercise else "—")
+            if exercise is not None:
+                if row == 0:
+                    menu_total += exercise.beats_per_bar * 60.0 / bpm
+                else:
+                    menu_total += 3 * exercise.beats_per_bar * 60.0 / bpm
+        self.menu_duration_label.setText(
+            f"演奏合計 {format_duration(performance_total)}　"
+            f"所要時間 {format_duration(menu_total)}（開始カウント・インターバル込み）"
+        )
+        selected_row = self.menu_items.currentRow()
+        if selected_row >= 0:
+            exercise_id = self.menu_items.item(selected_row, 1).data(Qt.ItemDataRole.UserRole)
+            exercise = self._exercises.get(exercise_id)
+            bpm_editor = self.menu_items.cellWidget(selected_row, 2)
+            if exercise is not None and isinstance(bpm_editor, QSpinBox):
+                self._set_preview_duration(exercise, bpm_editor.value())
+
+    def build_menu(self) -> PracticeMenu:
+        items = []
+        for row in range(self.menu_items.rowCount()):
+            exercise_id = self.menu_items.item(row, 1).data(Qt.ItemDataRole.UserRole)
+            bpm_editor = self.menu_items.cellWidget(row, 2)
+            bpm = bpm_editor.value() if isinstance(bpm_editor, QSpinBox) else 90
+            if exercise_id is not None:
+                items.append(PracticeMenuItem(int(exercise_id), min(240, max(30, bpm))))
+        return PracticeMenu(
+            id=self.menu_id,
+            name=self.menu_name.text().strip() or "名称未設定の練習メニュー",
+            items=items,
+        )
+
+    def _save_menu(self) -> None:
+        menu = self.storage.save_practice_menu(self.build_menu())
+        self.menu_id = menu.id
+        self.reload()
+        index = self.menu_combo.findData(menu.id)
+        self.menu_combo.setCurrentIndex(max(0, index))
+        QMessageBox.information(self, "保存しました", f"「{menu.name}」を保存しました。")
 
     def current_exercise(self) -> Exercise | None:
-        exercise_id = self.exercise_combo.currentData()
-        return self.storage.get_exercise(exercise_id) if exercise_id is not None else None
+        row = self.menu_items.currentRow()
+        if row < 0 or self.menu_items.item(row, 1) is None:
+            return None
+        exercise_id = self.menu_items.item(row, 1).data(Qt.ItemDataRole.UserRole)
+        return self._exercises.get(exercise_id)
 
     def _selection_changed(self) -> None:
         exercise = self.current_exercise()
         if exercise:
-            self.preview_grid.load_exercise(exercise)
-            self.staff.set_exercise(exercise)
+            row = self.menu_items.currentRow()
+            bpm_editor = self.menu_items.cellWidget(row, 2)
+            bpm = bpm_editor.value() if isinstance(bpm_editor, QSpinBox) else 90
+            self.show_exercise(exercise, bpm)
+
+    def show_exercise(self, exercise: Exercise, bpm: int | None = None) -> None:
+        self.preview_grid.load_exercise(exercise)
+        self.staff.set_exercise(exercise)
+        self.fretboard.set_exercise(exercise)
+        if bpm is not None:
+            self._set_preview_duration(exercise, bpm)
+
+    def _set_preview_duration(self, exercise: Exercise, bpm: int) -> None:
+        self.preview_duration_label.setText(
+            f"演奏時間 {format_duration(exercise_duration_seconds(exercise, bpm))}"
+            f"（{bpm} BPM）"
+        )
+
+    def _clear_preview(self) -> None:
+        empty = Exercise()
+        self.preview_grid.load_exercise(empty)
+        self.staff.set_exercise(empty)
+        self.fretboard.set_exercise(empty)
+        self.preview_duration_label.clear()
 
     def _start(self, assess: bool) -> None:
-        exercise = self.current_exercise()
-        if exercise:
-            self.start_requested.emit(exercise, assess)
-        else:
-            QMessageBox.information(self, "練習がありません", "TABエディターで練習を作成してください。")
+        menu = self.build_menu()
+        if not menu.items:
+            QMessageBox.information(self, "練習がありません", "メニューへ譜面を追加してください。")
+            return
+        missing = [item for item in menu.items if item.exercise_id not in self._exercises]
+        if missing:
+            QMessageBox.warning(self, "譜面が見つかりません", "削除済みの譜面をメニューから外してください。")
+            return
+        self.practice_tabs.setCurrentIndex(1)
+        self.start_menu_requested.emit(menu, assess)
 
     def _edit(self) -> None:
         exercise = self.current_exercise()
@@ -886,18 +1160,51 @@ class PracticePage(QWidget):
         self.play_button.setEnabled(not running)
         self.practice_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        for widget in (
+            self.menu_combo, self.new_menu_button, self.menu_name, self.save_menu_button,
+            self.exercise_picker, self.item_bpm, self.add_item_button, self.menu_items,
+            self.move_up_button, self.move_down_button, self.remove_item_button,
+            self.edit_item_button,
+        ):
+            widget.setEnabled(not running)
+        if not running:
+            self._status_context = ""
         self.status.setText("入力音を採点しています…" if running and assess else "再生中…" if running else "練習を選んで開始してください")
+
+    def set_menu_progress(
+        self,
+        index: int,
+        total: int,
+        exercise_name: str,
+        bpm: int,
+        *,
+        interval: bool = False,
+        assess: bool = False,
+    ) -> None:
+        if interval:
+            self._status_context = (
+                f"次: {index + 1}/{total}「{exercise_name}」 {bpm} BPM　"
+                "インターバル（無音2小節 → クリック1小節）"
+            )
+        else:
+            self._status_context = (
+                f"{index + 1}/{total}「{exercise_name}」 {bpm} BPM"
+                + ("　採点中" if assess else "　再生中")
+            )
+        self.status.setText(self._status_context)
 
     def prepare_staff(self, exercise: Exercise, bpm: int, count_in_beats: int) -> None:
         self.staff.set_exercise(exercise, bpm, count_in_beats)
+        self.fretboard.set_exercise(exercise)
+        self._set_preview_duration(exercise, bpm)
 
     def add_detected_note(self, observed_time: float, midi: float) -> None:
         self.staff.add_observation(observed_time, midi)
 
     def set_input_latency(self, latency_seconds: float, timing_offset: float = 0.0) -> None:
         self.status.setText(
-            "入力音を採点しています…"
-            f"（入力 {latency_seconds * 1000:.1f} ms / 校正 {timing_offset * 1000:+.0f} ms）"
+            (self._status_context or "入力音を採点しています…")
+            + f"（入力 {latency_seconds * 1000:.1f} ms / 校正 {timing_offset * 1000:+.0f} ms）"
         )
 
 

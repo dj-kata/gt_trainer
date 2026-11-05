@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .audio import AudioEngine, list_audio_devices, playback_end_step
-from .models import Exercise, SessionResult
+from .models import Exercise, PracticeMenu, SessionResult
 from .music import (
     CALIBRATION_COUNT_IN_BEATS,
     calibration_exercise,
@@ -41,6 +41,16 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("gt-trainer", "Guitar Trainer")
         self.active_exercise: Exercise | None = None
         self.active_assessment = False
+        self.active_bpm = 90
+        self.active_count_in_beats = 0
+        self.active_menu_items: list[tuple[Exercise, int]] = []
+        self.active_menu_index = -1
+        self.active_menu_name = ""
+        self.active_menu_assessment = False
+        self.active_menu_phase: str | None = None
+        self.active_menu_attempts = []
+        self.active_menu_details: list[tuple[str, int, float]] = []
+        self._menu_cancelled = False
         self.active_calibration = False
         self.calibration_dialog: CalibrationDialog | None = None
         self.calibration_exercise: Exercise | None = None
@@ -132,6 +142,7 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.practice = PracticePage(storage)
         self.editor = EditorPage(storage)
+        self.editor.set_bpm(self.bpm.value())
         self.progress = ProgressPage(storage)
         self.pages.addWidget(self.practice)
         self.pages.addWidget(self.editor)
@@ -139,15 +150,15 @@ class MainWindow(QMainWindow):
         content.addWidget(self.pages, 1)
         main.addLayout(content, 1)
 
-        self.practice.start_requested.connect(self.start_practice)
-        self.practice.stop_requested.connect(self.audio.stop)
+        self.practice.start_menu_requested.connect(self.start_practice_menu)
+        self.practice.stop_requested.connect(self._stop_practice)
         self.practice.edit_requested.connect(self.edit_exercise)
         self.editor.saved.connect(self._exercise_saved)
         self.editor.preview_requested.connect(
             lambda exercise, start_step: self.start_practice(exercise, False, start_step)
         )
         self.editor.notes_audition_requested.connect(self._preview_editor_notes)
-        self.editor.stop_requested.connect(self.audio.stop)
+        self.editor.stop_requested.connect(self._stop_practice)
         self.audio.position_changed.connect(self._position_changed)
         self.audio.playback_finished.connect(self._playback_finished)
         self.audio.error.connect(self._audio_error)
@@ -160,6 +171,7 @@ class MainWindow(QMainWindow):
         self.audio.input_monitor_error.connect(self._input_monitor_error)
         self.input_device.currentIndexChanged.connect(self._input_device_changed)
         self.output_device.currentIndexChanged.connect(self._update_calibration_label)
+        self.bpm.valueChanged.connect(self.editor.set_bpm)
         self.refresh_devices()
         self.show_page(0)
 
@@ -276,6 +288,7 @@ class MainWindow(QMainWindow):
     def start_practice(self, exercise: Exercise, assess: bool, start_step: int = 0) -> None:
         if self.audio.busy:
             return
+        self._reset_menu_state()
         start_step = min(max(0, start_step), exercise.total_steps)
         if playback_end_step(exercise, start_step) is None:
             message = (
@@ -285,20 +298,105 @@ class MainWindow(QMainWindow):
             )
             QMessageBox.warning(self, "譜面が空です", message)
             return
-        self.active_exercise = exercise
-        self.active_assessment = assess
         self.practice.set_running(True, assess)
         self.editor.set_running(True)
-        count_in_beats = exercise.beats_per_bar
-        self.practice.prepare_staff(exercise, self.bpm.value(), count_in_beats)
+        self._play_exercise(
+            exercise,
+            self.bpm.value(),
+            assess,
+            count_in_beats=exercise.beats_per_bar,
+            start_step=start_step,
+        )
+
+    def _play_exercise(
+        self,
+        exercise: Exercise,
+        bpm: int,
+        assess: bool,
+        *,
+        count_in_beats: int,
+        start_step: int = 0,
+    ) -> None:
+        self.active_exercise = exercise
+        self.active_assessment = assess
+        self.active_bpm = bpm
+        self.active_count_in_beats = count_in_beats
+        self.practice.show_exercise(exercise)
+        self.practice.prepare_staff(exercise, bpm, count_in_beats)
         # During assessment, the guide notes are muted so they cannot leak into pitch detection.
         self.audio.play(
-            exercise, self.bpm.value(), self.output_device.currentData(),
+            exercise, bpm, self.output_device.currentData(),
             input_device=self.input_device.currentData(), assess=assess,
             include_notes=not assess, count_in_beats=count_in_beats,
             start_step=start_step,
             timing_offset=self._timing_offset() if assess else 0.0,
         )
+
+    def start_practice_menu(self, menu: PracticeMenu, assess: bool) -> None:
+        if self.audio.busy:
+            return
+        items = []
+        for item in menu.items:
+            exercise = self.storage.get_exercise(item.exercise_id)
+            if exercise is None or playback_end_step(exercise) is None:
+                QMessageBox.warning(
+                    self,
+                    "練習メニューを開始できません",
+                    "削除済み、または音符のない譜面が含まれています。",
+                )
+                return
+            items.append((exercise, item.bpm))
+        if not items:
+            return
+        self.active_menu_items = items
+        self.active_menu_index = 0
+        self.active_menu_name = menu.name
+        self.active_menu_assessment = assess
+        self.active_menu_phase = "exercise"
+        self.active_menu_attempts = []
+        self.active_menu_details = []
+        self._menu_cancelled = False
+        self.practice.set_running(True, assess)
+        self.editor.set_running(True)
+        self._start_menu_item(0)
+
+    def _start_menu_item(self, index: int) -> None:
+        if self._menu_cancelled or not 0 <= index < len(self.active_menu_items):
+            self._finish_practice_menu(cancelled=True)
+            return
+        self.active_menu_index = index
+        self.active_menu_phase = "exercise"
+        exercise, bpm = self.active_menu_items[index]
+        count_in = exercise.beats_per_bar if index == 0 else 0
+        self.practice.set_menu_progress(
+            index, len(self.active_menu_items), exercise.name, bpm,
+            assess=self.active_menu_assessment,
+        )
+        self._play_exercise(
+            exercise,
+            bpm,
+            self.active_menu_assessment,
+            count_in_beats=count_in,
+        )
+
+    def _start_menu_interval(self) -> None:
+        next_index = self.active_menu_index + 1
+        if self._menu_cancelled or next_index >= len(self.active_menu_items):
+            self._finish_practice_menu(cancelled=self._menu_cancelled)
+            return
+        exercise, bpm = self.active_menu_items[next_index]
+        self.active_menu_phase = "interval"
+        self.practice.set_menu_progress(
+            next_index, len(self.active_menu_items), exercise.name, bpm, interval=True,
+        )
+        self.audio.play_interval(
+            bpm, exercise.beats_per_bar, self.output_device.currentData()
+        )
+
+    def _stop_practice(self) -> None:
+        if self.active_menu_phase is not None:
+            self._menu_cancelled = True
+        self.audio.stop()
 
     def _observation_detected(self, observed_time: float, midi: float, confidence: float) -> None:
         if self.active_assessment and not self.active_calibration:
@@ -313,27 +411,64 @@ class MainWindow(QMainWindow):
             self.calibration_dialog.set_step(step)
         self.practice.preview_grid.set_playhead(step)
         self.practice.staff.set_playhead(step)
+        self.practice.fretboard.set_playhead(step)
         self.editor.grid.set_playhead(step)
         self.editor.staff.set_playhead(step)
+        self.editor.fretboard.set_playhead(step)
 
     def _playback_finished(self, observations: list, cancelled: bool) -> None:
-        QTimer.singleShot(100, self._restart_input_monitor)
         if self.active_calibration:
+            QTimer.singleShot(100, self._restart_input_monitor)
             self._finish_calibration(observations, cancelled)
             return
+        if self.active_menu_phase == "interval":
+            if cancelled or self._menu_cancelled:
+                self._finish_practice_menu(cancelled=True)
+            else:
+                QTimer.singleShot(50, lambda: self._start_menu_item(self.active_menu_index + 1))
+            return
+        if self.active_menu_phase == "exercise":
+            if cancelled or self._menu_cancelled:
+                self._finish_practice_menu(cancelled=True)
+                return
+            if self.active_menu_assessment:
+                attempts, total = self._save_active_assessment(observations)
+                self.active_menu_attempts.extend(attempts)
+                self.active_menu_details.append(
+                    (self.active_exercise.name, self.active_bpm, total)
+                )
+            if self.active_menu_index + 1 < len(self.active_menu_items):
+                QTimer.singleShot(50, self._start_menu_interval)
+            else:
+                self._finish_practice_menu(cancelled=False)
+            return
+
+        QTimer.singleShot(100, self._restart_input_monitor)
         self.practice.set_running(False)
         self.editor.set_running(False)
         if cancelled or not self.active_assessment or not self.active_exercise:
             return
+        attempts, total = self._save_active_assessment(observations)
+        pitch, timing, _ = score_attempts(attempts)
+        detected = sum(a.detected_midi is not None for a in attempts)
+        QMessageBox.information(
+            self, "採点結果",
+            f"総合  {total:.0f}点\n\n音程  {pitch:.0f}点　　リズム  {timing:.0f}点\n"
+            f"検出 {detected} / {len(attempts)} 音",
+        )
+
+    def _save_active_assessment(self, observations: list) -> tuple[list, float]:
+        if self.active_exercise is None:
+            return [], 0.0
         attempts = evaluate_performance(
-            self.active_exercise, self.bpm.value(), observations,
-            count_in_beats=self.active_exercise.beats_per_bar,
+            self.active_exercise, self.active_bpm, observations,
+            count_in_beats=self.active_count_in_beats,
         )
         pitch, timing, total = score_attempts(attempts)
         result = SessionResult(
             exercise_id=self.active_exercise.id,
             exercise_name=self.active_exercise.name,
-            bpm=self.bpm.value(),
+            bpm=self.active_bpm,
             started_at=datetime.now().isoformat(timespec="seconds"),
             pitch_score=pitch,
             timing_score=timing,
@@ -342,12 +477,38 @@ class MainWindow(QMainWindow):
         )
         self.storage.save_session(result)
         self.progress.reload()
-        detected = sum(a.detected_midi is not None for a in attempts)
-        QMessageBox.information(
-            self, "採点結果",
-            f"総合  {total:.0f}点\n\n音程  {pitch:.0f}点　　リズム  {timing:.0f}点\n"
-            f"検出 {detected} / {len(attempts)} 音",
-        )
+        return attempts, total
+
+    def _finish_practice_menu(self, *, cancelled: bool) -> None:
+        QTimer.singleShot(100, self._restart_input_monitor)
+        self.practice.set_running(False)
+        self.editor.set_running(False)
+        if not cancelled and self.active_menu_assessment and self.active_menu_attempts:
+            pitch, timing, total = score_attempts(self.active_menu_attempts)
+            details = "\n".join(
+                f"{index + 1}. {name}  {bpm} BPM: {score:.0f}点"
+                for index, (name, bpm, score) in enumerate(self.active_menu_details)
+            )
+            detected = sum(
+                attempt.detected_midi is not None for attempt in self.active_menu_attempts
+            )
+            QMessageBox.information(
+                self,
+                f"「{self.active_menu_name}」採点結果",
+                f"総合  {total:.0f}点\n\n音程  {pitch:.0f}点　　リズム  {timing:.0f}点\n"
+                f"検出 {detected} / {len(self.active_menu_attempts)} 音\n\n{details}",
+            )
+        self._reset_menu_state()
+
+    def _reset_menu_state(self) -> None:
+        self.active_menu_items = []
+        self.active_menu_index = -1
+        self.active_menu_name = ""
+        self.active_menu_assessment = False
+        self.active_menu_phase = None
+        self.active_menu_attempts = []
+        self.active_menu_details = []
+        self._menu_cancelled = False
 
     def _finish_calibration(self, observations: list, cancelled: bool) -> None:
         dialog = self.calibration_dialog
@@ -399,6 +560,7 @@ class MainWindow(QMainWindow):
             self._finish_calibration([], True)
         self.practice.set_running(False)
         self.editor.set_running(False)
+        self._menu_cancelled = True
         QMessageBox.critical(self, "音声エラー", message)
 
     def edit_exercise(self, exercise: Exercise) -> None:

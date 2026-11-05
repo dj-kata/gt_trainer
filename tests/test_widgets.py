@@ -11,9 +11,11 @@ from PySide6.QtWidgets import (
 )
 
 from gt_trainer.staff import StaffWidget
+from gt_trainer.fretboard import FretboardWidget
+from gt_trainer.models import Exercise, PracticeMenuItem, TabNote
 from gt_trainer.storage import Storage
 from gt_trainer.music import calibration_exercise
-from gt_trainer.widgets import CalibrationDialog, EditorPage, TabGrid
+from gt_trainer.widgets import CalibrationDialog, EditorPage, PracticePage, TabGrid
 
 
 def test_calibration_dialog_prompts_open_strings_in_order() -> None:
@@ -368,7 +370,45 @@ def test_staff_uses_same_pixel_timeline_as_tab() -> None:
     application.processEvents()
 
 
-def test_playhead_scroll_keeps_one_bar_ahead_visible() -> None:
+def test_staff_folds_extreme_guitar_notes_with_octave_marks() -> None:
+    low = StaffWidget._staff_placement(40)
+    middle = StaffWidget._staff_placement(64)
+    high = StaffWidget._staff_placement(88)
+
+    assert -2 <= low.position <= 10
+    assert low.octave_label == "8vb"
+    assert middle.octave_label == ""
+    assert -2 <= high.position <= 10
+    assert high.octave_label == "15ma"
+
+
+def test_fretboard_highlights_all_notes_at_playhead() -> None:
+    application = QApplication.instance() or QApplication([])
+    fretboard = FretboardWidget()
+    fretboard.set_exercise(Exercise(notes=[
+        TabNote(step=4, string=1, fret=13, duration_steps=2),
+        TabNote(step=4, string=3, fret=15),
+        TabNote(step=6, string=5, fret=7),
+    ]))
+
+    fretboard.set_playhead(4)
+    assert [(note.string, note.fret) for note in fretboard.active_notes()] == [
+        (1, 13), (3, 15),
+    ]
+    fretboard.set_playhead(5)
+    assert [(note.string, note.fret) for note in fretboard.active_notes()] == [(1, 13)]
+    fretboard.set_playhead(-1)
+    assert fretboard.active_notes() == []
+    assert fretboard.position_markers() == {
+        (1, 13): "C",
+        (3, 15): "F",
+        (5, 7): "B",
+    }
+    fretboard.close()
+    application.processEvents()
+
+
+def test_playhead_scroll_pages_at_bar_boundaries() -> None:
     application = QApplication.instance() or QApplication([])
     grid = TabGrid()
     grid.configure(total_steps=96, steps_per_beat=4, beats_per_bar=4)
@@ -376,18 +416,22 @@ def test_playhead_scroll_keeps_one_bar_ahead_visible() -> None:
     grid.show()
     application.processEvents()
 
-    grid.set_playhead(24)
+    grid.set_playhead(17)
+    application.processEvents()
+    second_bar_scroll = grid.horizontalScrollBar().value()
+    grid.set_playhead(31)
     application.processEvents()
 
     header = grid.horizontalHeader()
-    current_left = header.sectionViewportPosition(24)
-    bar_last = 24 + 4 * 4 - 1
-    bar_right = (
-        header.sectionViewportPosition(bar_last) + header.sectionSize(bar_last)
-    )
-    assert grid.horizontalScrollBar().value() > 0
-    assert current_left >= 0
-    assert bar_right <= grid.viewport().width()
+    assert second_bar_scroll == header.sectionPosition(16)
+    assert grid.horizontalScrollBar().value() == second_bar_scroll
+    assert header.sectionViewportPosition(16) == 0
+
+    grid.set_playhead(32)
+    application.processEvents()
+
+    assert grid.horizontalScrollBar().value() == header.sectionPosition(32)
+    assert grid.horizontalScrollBar().value() - second_bar_scroll == 16 * grid.columnWidth(0)
     grid.close()
     application.processEvents()
 
@@ -460,6 +504,11 @@ def test_editor_can_preview_from_start_or_cursor_and_stop(tmp_path) -> None:
     )
     page.stop_requested.connect(lambda: stops.append(True))
     page.grid.item(2, 9).setText("7")
+    page.grid.item(2, 15).setText("9")
+    page.set_bpm(60)
+
+    assert "0:04.0" in page.duration_label.text()
+    assert "60 BPM" in page.duration_label.text()
 
     page.play_from_start_button.click()
     page.grid.setCurrentCell(5, 6)
@@ -475,6 +524,51 @@ def test_editor_can_preview_from_start_or_cursor_and_stop(tmp_path) -> None:
     page.stop_button.click()
     assert stops == [True]
 
+    page.close()
+    storage.close()
+    application.processEvents()
+
+
+def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -> None:
+    application = QApplication.instance() or QApplication([])
+    storage = Storage(tmp_path / "practice_menu.db")
+    exercise = storage.save_exercise(Exercise(
+        name="譜面A", notes=[TabNote(step=15, string=5, fret=0)],
+    ))
+    page = PracticePage(storage)
+    page.resize(1000, 900)
+    page.show()
+    application.processEvents()
+    page.menu_name.setText("1日の基礎練習")
+    page.exercise_picker.setCurrentIndex(page.exercise_picker.findData(exercise.id))
+    page.item_bpm.setValue(60)
+    page._add_item()
+    page.item_bpm.setValue(70)
+    page._add_item()
+
+    menu = page.build_menu()
+
+    assert menu.name == "1日の基礎練習"
+    assert menu.items == [
+        PracticeMenuItem(exercise.id, 60),
+        PracticeMenuItem(exercise.id, 70),
+    ]
+    assert page.menu_items.item(0, 3).text() == "0:04.0"
+    assert page.menu_items.item(1, 3).text() == "0:03.4"
+    assert "演奏合計 0:07.4" in page.menu_duration_label.text()
+    assert "所要時間" in page.menu_duration_label.text()
+    assert "0:03.4" in page.preview_duration_label.text()
+    assert "70 BPM" in page.preview_duration_label.text()
+    requested = []
+    page.start_menu_requested.connect(
+        lambda selected_menu, assess: requested.append((selected_menu, assess))
+    )
+    page.practice_button.click()
+    assert page.practice_tabs.currentIndex() == 1
+    assert [(item.exercise_id, item.bpm) for item in requested[0][0].items] == [
+        (exercise.id, 60), (exercise.id, 70),
+    ]
+    assert requested[0][1]
     page.close()
     storage.close()
     application.processEvents()

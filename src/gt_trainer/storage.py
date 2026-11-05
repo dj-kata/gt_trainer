@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .models import Exercise, NoteAttempt, SessionResult
+from .models import Exercise, NoteAttempt, PracticeMenu, SessionResult
 
 
 def default_database_path() -> Path:
@@ -39,6 +39,12 @@ class Storage:
                 total_score REAL NOT NULL,
                 attempts TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS practice_menus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                data TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         self.connection.commit()
 
@@ -70,6 +76,39 @@ class Storage:
     def delete_exercise(self, exercise_id: int) -> None:
         self.connection.execute("DELETE FROM exercises WHERE id=?", (exercise_id,))
         self.connection.commit()
+
+    def save_practice_menu(self, menu: PracticeMenu) -> PracticeMenu:
+        payload = json.dumps(menu.to_dict(), ensure_ascii=False)
+        if menu.id is None:
+            cursor = self.connection.execute(
+                "INSERT INTO practice_menus(name, data) VALUES (?, ?)",
+                (menu.name, payload),
+            )
+            menu.id = int(cursor.lastrowid)
+            payload = json.dumps(menu.to_dict(), ensure_ascii=False)
+            self.connection.execute(
+                "UPDATE practice_menus SET data=? WHERE id=?", (payload, menu.id)
+            )
+        else:
+            self.connection.execute(
+                """UPDATE practice_menus
+                   SET name=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (menu.name, payload, menu.id),
+            )
+        self.connection.commit()
+        return menu
+
+    def list_practice_menus(self) -> list[PracticeMenu]:
+        rows = self.connection.execute(
+            "SELECT data FROM practice_menus ORDER BY updated_at DESC, id DESC"
+        )
+        return [PracticeMenu.from_dict(json.loads(row["data"])) for row in rows]
+
+    def get_practice_menu(self, menu_id: int) -> PracticeMenu | None:
+        row = self.connection.execute(
+            "SELECT data FROM practice_menus WHERE id=?", (menu_id,)
+        ).fetchone()
+        return PracticeMenu.from_dict(json.loads(row["data"])) if row else None
 
     def save_session(self, result: SessionResult) -> None:
         attempts = json.dumps([

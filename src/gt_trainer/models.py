@@ -63,6 +63,28 @@ class Exercise:
 
 
 @dataclass(slots=True)
+class PracticeMenuItem:
+    exercise_id: int
+    bpm: int = 90
+
+
+@dataclass(slots=True)
+class PracticeMenu:
+    id: int | None = None
+    name: str = "新しい練習メニュー"
+    items: list[PracticeMenuItem] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PracticeMenu":
+        data = dict(value)
+        data["items"] = [PracticeMenuItem(**item) for item in data.get("items", [])]
+        return cls(**data)
+
+
+@dataclass(slots=True)
 class NoteAttempt:
     expected_midi: int
     expected_time: float

@@ -18,6 +18,13 @@ class DetectedNote:
     pitch_error_cents: float
 
 
+@dataclass(frozen=True, slots=True)
+class StaffPlacement:
+    position: float
+    accidental: bool
+    octave_label: str = ""
+
+
 class StaffWidget(QWidget):
     """Compact treble staff for expected and live-detected monophonic notes."""
 
@@ -92,7 +99,7 @@ class StaffWidget(QWidget):
         return self.timeline_left + step * self.pixels_per_step - self.scroll_offset
 
     @staticmethod
-    def _staff_position(midi: float) -> tuple[float, bool]:
+    def _staff_placement(midi: float) -> StaffPlacement:
         # Guitar treble notation is written one octave above sounding pitch.
         rounded = round(midi) + 12
         pitch_class = rounded % 12
@@ -102,11 +109,21 @@ class StaffWidget(QWidget):
         # Bottom line of a treble staff is E4.
         position = absolute_diatonic - (4 * 7 + 2)
         accidental = pitch_class in (1, 3, 6, 8, 10)
-        return float(position), accidental
+        octave_shift = 0
+        while position > 10:
+            position -= 7
+            octave_shift += 1
+        while position < -2:
+            position += 7
+            octave_shift -= 1
+        labels = {1: "8va", 2: "15ma", -1: "8vb", -2: "15mb"}
+        return StaffPlacement(float(position), accidental, labels.get(octave_shift, ""))
 
-    def _note_y(self, midi: float, bottom: float, half_space: float) -> tuple[float, bool, float]:
-        position, accidental = self._staff_position(midi)
-        return bottom - position * half_space, accidental, position
+    def _note_y(
+        self, midi: float, bottom: float, half_space: float,
+    ) -> tuple[float, StaffPlacement]:
+        placement = self._staff_placement(midi)
+        return bottom - placement.position * half_space, placement
 
     def _draw_note(
         self,
@@ -118,15 +135,29 @@ class StaffWidget(QWidget):
         color: QColor,
         *,
         filled: bool,
+        show_octave_label: bool = True,
     ) -> None:
-        y, accidental, position = self._note_y(midi, bottom, half_space)
+        y, placement = self._note_y(midi, bottom, half_space)
+        position = placement.position
         painter.setPen(QPen(color, 1.6))
         painter.setBrush(color if filled else Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QRectF(x - 6, y - 4, 12, 8))
-        painter.drawLine(int(x + 5), int(y), int(x + 5), int(y - 25))
-        if accidental:
+        if position >= 4:
+            painter.drawLine(int(x - 5), int(y), int(x - 5), int(y + 25))
+        else:
+            painter.drawLine(int(x + 5), int(y), int(x + 5), int(y - 25))
+        if placement.accidental:
             painter.setFont(QFont("Noto Sans", 9))
             painter.drawText(QRectF(x - 17, y - 9, 10, 18), Qt.AlignmentFlag.AlignCenter, "♯")
+        if show_octave_label and placement.octave_label:
+            above = placement.octave_label.endswith(("va", "ma"))
+            label_y = y - 23 if above else y + 8
+            painter.setFont(QFont("Noto Sans", 7, QFont.Weight.Bold))
+            painter.drawText(
+                QRectF(x - 16, label_y, 32, 13),
+                Qt.AlignmentFlag.AlignCenter,
+                placement.octave_label,
+            )
         # Ledger lines outside the five-line staff.
         ledger = int(position // 2 * 2)
         if position < 0:
@@ -158,6 +189,8 @@ class StaffWidget(QWidget):
         painter.setFont(QFont("Segoe UI Symbol", 30))
         painter.setPen(QColor("#c3cedd"))
         painter.drawText(max(2, int(left - 39)), int(bottom + 8), "𝄞")
+        painter.setFont(QFont("Noto Sans", 8, QFont.Weight.Bold))
+        painter.drawText(max(12, int(left - 25)), int(bottom + 18), "8")
 
         painter.setPen(QPen(QColor("#718096"), 1))
         for line in range(5):
@@ -223,7 +256,16 @@ class StaffWidget(QWidget):
             color = QColor("#63d7b5" if good_pitch and good_timing else "#ffb35c" if good_pitch else "#ff6b6b")
             painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
             painter.drawLine(int(expected_x), int(top - 9), int(actual_x), int(top - 9))
-            self._draw_note(painter, actual_x, detected.midi, bottom, half_space, color, filled=True)
+            self._draw_note(
+                painter,
+                actual_x,
+                detected.midi,
+                bottom,
+                half_space,
+                color,
+                filled=True,
+                show_octave_label=False,
+            )
             painter.setFont(QFont("Noto Sans", 7))
             painter.setPen(color)
             sign = "+" if detected.timing_error_ms >= 0 else ""

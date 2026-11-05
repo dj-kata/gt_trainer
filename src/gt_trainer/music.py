@@ -26,6 +26,23 @@ def midi_name(note: float | int) -> str:
     return f"{names[rounded % 12]}{rounded // 12 - 1}"
 
 
+def exercise_duration_seconds(exercise: Exercise, bpm: int) -> float:
+    """Return sounding score duration through the end of its last note."""
+    end_step = max(
+        (note.step + max(1, note.duration_steps) for note in exercise.notes),
+        default=0,
+    )
+    return end_step * 60.0 / max(1, bpm) / max(1, exercise.steps_per_beat)
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration as minutes and seconds with tenth-second precision."""
+    seconds = max(0.0, seconds)
+    minutes = int(seconds // 60)
+    remainder = seconds - minutes * 60
+    return f"{minutes}:{remainder:04.1f}"
+
+
 @dataclass(slots=True)
 class PitchObservation:
     time: float
