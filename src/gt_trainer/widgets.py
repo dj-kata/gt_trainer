@@ -923,7 +923,7 @@ class PracticePage(QWidget):
         self.menu_items.setColumnWidth(3, 92)
         self.menu_items.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.menu_items.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.menu_items.setMaximumHeight(132)
+        self.menu_items.setMinimumHeight(260)
         self.menu_items.itemSelectionChanged.connect(self._selection_changed)
         self.menu_items.cellClicked.connect(lambda row, column: self.menu_items.selectRow(row))
         menu_layout.addWidget(self.menu_items, 1)

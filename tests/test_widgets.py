@@ -596,6 +596,9 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
     page.resize(1000, 900)
     page.show()
     application.processEvents()
+    assert page.menu_items.minimumHeight() == 260
+    assert page.menu_items.height() >= 260
+    assert page.menu_items.maximumHeight() > 260
     page.menu_name.setText("1日の基礎練習")
     page.exercise_picker.setCurrentIndex(page.exercise_picker.findData(exercise.id))
     page.item_bpm.setValue(60)
