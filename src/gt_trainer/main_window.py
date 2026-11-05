@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+from statistics import median
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QStackedWidget,
@@ -18,9 +21,16 @@ from PySide6.QtWidgets import (
 
 from .audio import AudioEngine, list_audio_devices, playback_end_step
 from .models import Exercise, SessionResult
-from .music import evaluate_performance, score_attempts
+from .music import (
+    CALIBRATION_COUNT_IN_BEATS,
+    calibration_exercise,
+    calibration_silent_click_steps,
+    estimate_timing_calibration,
+    evaluate_performance,
+    score_attempts,
+)
 from .storage import Storage
-from .widgets import EditorPage, PracticePage, ProgressPage
+from .widgets import CalibrationDialog, EditorPage, PracticePage, ProgressPage
 
 
 class MainWindow(QMainWindow):
@@ -31,6 +41,10 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("gt-trainer", "Guitar Trainer")
         self.active_exercise: Exercise | None = None
         self.active_assessment = False
+        self.active_calibration = False
+        self.calibration_dialog: CalibrationDialog | None = None
+        self.calibration_exercise: Exercise | None = None
+        self._closing = False
         self.setWindowTitle("Guitar Trainer")
         self.resize(1180, 780)
         self.setMinimumSize(900, 620)
@@ -75,6 +89,16 @@ class MainWindow(QMainWindow):
         self.output_device = QComboBox()
         self.input_device.setMinimumWidth(170)
         self.output_device.setMinimumWidth(170)
+        self.input_level = QProgressBar()
+        self.input_level.setRange(0, 100)
+        self.input_level.setValue(0)
+        self.input_level.setTextVisible(False)
+        self.input_level.setFixedSize(72, 12)
+        self.input_level.setToolTip("選択中の入力デバイスの信号レベル")
+        self.input_level.setStyleSheet(
+            "QProgressBar { background: #1b2432; border: 1px solid #344158; }"
+            "QProgressBar::chunk { background: #63d7b5; }"
+        )
         refresh = QPushButton("↻")
         refresh.setFixedWidth(38)
         refresh.clicked.connect(self.refresh_devices)
@@ -89,8 +113,12 @@ class MainWindow(QMainWindow):
         self.metronome = QPushButton("メトロノーム")
         self.metronome.setCheckable(True)
         self.metronome.clicked.connect(self.toggle_metronome)
+        self.calibrate = QPushButton("タイミング校正")
+        self.calibrate.clicked.connect(self.start_calibration)
         tools.addWidget(QLabel("IN"))
         tools.addWidget(self.input_device)
+        tools.addWidget(QLabel("LEVEL"))
+        tools.addWidget(self.input_level)
         tools.addWidget(QLabel("OUT"))
         tools.addWidget(self.output_device)
         tools.addWidget(refresh)
@@ -98,6 +126,7 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.bpm)
         tools.addWidget(self.meter)
         tools.addWidget(self.metronome)
+        tools.addWidget(self.calibrate)
         content.addWidget(toolbar)
 
         self.pages = QStackedWidget()
@@ -117,6 +146,7 @@ class MainWindow(QMainWindow):
         self.editor.preview_requested.connect(
             lambda exercise, start_step: self.start_practice(exercise, False, start_step)
         )
+        self.editor.notes_audition_requested.connect(self._preview_editor_notes)
         self.editor.stop_requested.connect(self.audio.stop)
         self.audio.position_changed.connect(self._position_changed)
         self.audio.playback_finished.connect(self._playback_finished)
@@ -124,6 +154,12 @@ class MainWindow(QMainWindow):
         self.audio.metronome_changed.connect(self.metronome.setChecked)
         self.audio.observation_detected.connect(self._observation_detected)
         self.audio.input_latency_changed.connect(self._input_latency_changed)
+        self.audio.input_level_changed.connect(
+            lambda level: self.input_level.setValue(round(level * 100))
+        )
+        self.audio.input_monitor_error.connect(self._input_monitor_error)
+        self.input_device.currentIndexChanged.connect(self._input_device_changed)
+        self.output_device.currentIndexChanged.connect(self._update_calibration_label)
         self.refresh_devices()
         self.show_page(0)
 
@@ -137,6 +173,8 @@ class MainWindow(QMainWindow):
     def refresh_devices(self) -> None:
         remembered_input = self.settings.value("input_device")
         remembered_output = self.settings.value("output_device")
+        self.input_device.blockSignals(True)
+        self.output_device.blockSignals(True)
         self.input_device.clear()
         self.output_device.clear()
         self.input_device.addItem("システム既定", None)
@@ -153,12 +191,87 @@ class MainWindow(QMainWindow):
                     combo.setCurrentIndex(max(0, found))
         except Exception as exc:
             self.statusBar().showMessage(f"音声デバイスを取得できません: {exc}", 8000)
+        finally:
+            self.input_device.blockSignals(False)
+            self.output_device.blockSignals(False)
+        self._input_device_changed()
+
+    def _input_device_changed(self, *args) -> None:  # noqa: ANN002
+        self._update_calibration_label()
+        self._restart_input_monitor()
+
+    def _restart_input_monitor(self) -> None:
+        if self._closing:
+            return
+        if self.audio.busy:
+            QTimer.singleShot(100, self._restart_input_monitor)
+            return
+        self.audio.start_input_monitor(self.input_device.currentData())
+
+    def _input_monitor_error(self, message: str) -> None:
+        self.input_level.setValue(0)
+        self.statusBar().showMessage(f"入力レベルを確認できません: {message}", 8000)
+
+    def _device_pair_key(self) -> str:
+        identity = "\n".join((
+            f"{self.input_device.currentData()}:{self.input_device.currentText()}",
+            f"{self.output_device.currentData()}:{self.output_device.currentText()}",
+        ))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+    def _timing_offset(self) -> float:
+        value = self.settings.value(
+            f"timing_calibration/{self._device_pair_key()}/offset_seconds", 0.0
+        )
+        try:
+            return max(-0.45, min(0.45, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _update_calibration_label(self, *args) -> None:  # noqa: ANN002
+        offset_ms = self._timing_offset() * 1000.0
+        if abs(offset_ms) >= 0.5:
+            self.calibrate.setText(f"タイミング校正 ({offset_ms:+.0f} ms)")
+        else:
+            self.calibrate.setText("タイミング校正")
 
     def toggle_metronome(self, checked: bool) -> None:
         if checked:
             self.audio.start_metronome(self.bpm.value(), self.meter.currentData(), self.output_device.currentData())
         else:
             self.audio.stop_metronome()
+
+    def _preview_editor_notes(self, midi_notes: list[int]) -> None:
+        self.audio.preview_notes(midi_notes, self.output_device.currentData())
+
+    def start_calibration(self) -> None:
+        if self.audio.busy:
+            return
+        exercise = calibration_exercise()
+        dialog = CalibrationDialog(exercise, self)
+        dialog.rejected.connect(self._cancel_calibration)
+        self.active_calibration = True
+        self.active_assessment = False
+        self.active_exercise = None
+        self.calibration_exercise = exercise
+        self.calibration_dialog = dialog
+        self.calibrate.setEnabled(False)
+        dialog.show()
+        self.audio.play(
+            exercise,
+            self.bpm.value(),
+            self.output_device.currentData(),
+            input_device=self.input_device.currentData(),
+            assess=True,
+            include_notes=False,
+            count_in_beats=CALIBRATION_COUNT_IN_BEATS,
+            timing_offset=0.0,
+            silent_click_steps=calibration_silent_click_steps(exercise),
+        )
+
+    def _cancel_calibration(self) -> None:
+        if self.active_calibration:
+            self.audio.stop()
 
     def start_practice(self, exercise: Exercise, assess: bool, start_step: int = 0) -> None:
         if self.audio.busy:
@@ -184,23 +297,30 @@ class MainWindow(QMainWindow):
             input_device=self.input_device.currentData(), assess=assess,
             include_notes=not assess, count_in_beats=count_in_beats,
             start_step=start_step,
+            timing_offset=self._timing_offset() if assess else 0.0,
         )
 
     def _observation_detected(self, observed_time: float, midi: float, confidence: float) -> None:
-        if self.active_assessment:
+        if self.active_assessment and not self.active_calibration:
             self.practice.add_detected_note(observed_time, midi)
 
     def _input_latency_changed(self, latency_seconds: float) -> None:
         if self.active_assessment:
-            self.practice.set_input_latency(latency_seconds)
+            self.practice.set_input_latency(latency_seconds, self._timing_offset())
 
     def _position_changed(self, step: int) -> None:
+        if self.active_calibration and self.calibration_dialog is not None:
+            self.calibration_dialog.set_step(step)
         self.practice.preview_grid.set_playhead(step)
         self.practice.staff.set_playhead(step)
         self.editor.grid.set_playhead(step)
         self.editor.staff.set_playhead(step)
 
     def _playback_finished(self, observations: list, cancelled: bool) -> None:
+        QTimer.singleShot(100, self._restart_input_monitor)
+        if self.active_calibration:
+            self._finish_calibration(observations, cancelled)
+            return
         self.practice.set_running(False)
         self.editor.set_running(False)
         if cancelled or not self.active_assessment or not self.active_exercise:
@@ -229,7 +349,54 @@ class MainWindow(QMainWindow):
             f"検出 {detected} / {len(attempts)} 音",
         )
 
+    def _finish_calibration(self, observations: list, cancelled: bool) -> None:
+        dialog = self.calibration_dialog
+        exercise = self.calibration_exercise
+        self.active_calibration = False
+        self.calibration_dialog = None
+        self.calibration_exercise = None
+        self.calibrate.setEnabled(True)
+        if dialog is not None:
+            dialog.accept()
+        if cancelled or exercise is None:
+            self._update_calibration_label()
+            return
+        estimate = estimate_timing_calibration(
+            exercise,
+            self.bpm.value(),
+            observations,
+            count_in_beats=CALIBRATION_COUNT_IN_BEATS,
+        )
+        if estimate is None:
+            QMessageBox.warning(
+                self,
+                "校正できませんでした",
+                "各弦の正しい開放弦を検出できませんでした。\n"
+                "入力レベルとチューニングを確認して、もう一度お試しください。",
+            )
+            self._update_calibration_label()
+            return
+        key = f"timing_calibration/{self._device_pair_key()}"
+        self.settings.setValue(f"{key}/offset_seconds", estimate.offset_seconds)
+        self.settings.setValue(f"{key}/input", self.input_device.currentText())
+        self.settings.setValue(f"{key}/output", self.output_device.currentText())
+        self.settings.sync()
+        self._update_calibration_label()
+        lines = []
+        names = {40: "6弦", 45: "5弦", 50: "4弦", 55: "3弦", 59: "2弦", 64: "1弦"}
+        for midi in (40, 45, 50, 55, 59, 64):
+            values = estimate.errors_by_midi[midi]
+            lines.append(f"{names[midi]}: {median(values) * 1000:+.0f} ms")
+        QMessageBox.information(
+            self,
+            "タイミング校正が完了しました",
+            f"適用する補正: {estimate.offset_seconds * 1000:+.0f} ms\n\n"
+            + "\n".join(lines),
+        )
+
     def _audio_error(self, message: str) -> None:
+        if self.active_calibration:
+            self._finish_calibration([], True)
         self.practice.set_running(False)
         self.editor.set_running(False)
         QMessageBox.critical(self, "音声エラー", message)
@@ -242,8 +409,10 @@ class MainWindow(QMainWindow):
         self.practice.reload()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001, N802
+        self._closing = True
         self.audio.stop()
         self.audio.stop_metronome()
+        self.audio.stop_input_monitor()
         self.settings.setValue("bpm", self.bpm.value())
         if self.input_device.currentData() is not None:
             self.settings.setValue("input_device", self.input_device.currentData())

@@ -12,7 +12,35 @@ from PySide6.QtWidgets import (
 
 from gt_trainer.staff import StaffWidget
 from gt_trainer.storage import Storage
-from gt_trainer.widgets import EditorPage, TabGrid
+from gt_trainer.music import calibration_exercise
+from gt_trainer.widgets import CalibrationDialog, EditorPage, TabGrid
+
+
+def test_calibration_dialog_prompts_open_strings_in_order() -> None:
+    application = QApplication.instance() or QApplication([])
+    dialog = CalibrationDialog(calibration_exercise())
+
+    dialog.set_step(-4)
+    assert "次は6弦開放" in dialog.current.text()
+    assert "カウント 4" in dialog.current.text()
+    dialog.set_step(-1)
+    assert "カウント 1" in dialog.current.text()
+    dialog.set_step(0)
+    assert "今：6弦開放" in dialog.current.text()
+    dialog.set_step(1)
+    assert "次は5弦開放" in dialog.current.text()
+    assert "休止中（あと2拍）" in dialog.current.text()
+    dialog.set_step(2)
+    assert "休止中（あと1拍）" in dialog.current.text()
+    dialog.set_step(3)
+    assert "カウント 4" in dialog.current.text()
+    dialog.set_step(6)
+    assert "カウント 1" in dialog.current.text()
+    dialog.set_step(7)
+    assert "今：5弦開放" in dialog.current.text()
+
+    dialog.close()
+    application.processEvents()
 
 
 def test_tab_grid_advances_right_after_edit() -> None:
@@ -24,6 +52,25 @@ def test_tab_grid_advances_right_after_edit() -> None:
 
     assert grid.currentRow() == 2
     assert grid.currentColumn() == 4
+    grid.close()
+    application.processEvents()
+
+
+def test_tab_edit_auditions_all_notes_at_same_position() -> None:
+    application = QApplication.instance() or QApplication([])
+    grid = TabGrid()
+    grid.item(5, 3).setText("3")
+    heard = []
+    grid.audition_requested.connect(heard.append)
+    index = grid.model().index(2, 3)
+    option = QStyleOptionViewItem()
+    editor = grid.itemDelegate().createEditor(grid.viewport(), option, index)
+    editor.setText("7")
+
+    grid.itemDelegate().setModelData(editor, grid.model(), index)
+
+    assert heard == [[62, 43]]
+    editor.close()
     grid.close()
     application.processEvents()
 
@@ -318,6 +365,30 @@ def test_staff_uses_same_pixel_timeline_as_tab() -> None:
     assert staff._step_x(2) == 50.0
     assert staff._step_boundary_x(2) == 31.0
     staff.close()
+    application.processEvents()
+
+
+def test_playhead_scroll_keeps_one_bar_ahead_visible() -> None:
+    application = QApplication.instance() or QApplication([])
+    grid = TabGrid()
+    grid.configure(total_steps=96, steps_per_beat=4, beats_per_bar=4)
+    grid.resize(760, grid.height())
+    grid.show()
+    application.processEvents()
+
+    grid.set_playhead(24)
+    application.processEvents()
+
+    header = grid.horizontalHeader()
+    current_left = header.sectionViewportPosition(24)
+    bar_last = 24 + 4 * 4 - 1
+    bar_right = (
+        header.sectionViewportPosition(bar_last) + header.sectionSize(bar_last)
+    )
+    assert grid.horizontalScrollBar().value() > 0
+    assert current_left >= 0
+    assert bar_right <= grid.viewport().width()
+    grid.close()
     application.processEvents()
 
 

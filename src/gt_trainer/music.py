@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from statistics import median
 
-from .models import Exercise, NoteAttempt
+from .models import Exercise, NoteAttempt, OPEN_STRING_MIDI, TabNote
+
+
+CALIBRATION_COUNT_IN_BEATS = 4
 
 
 def midi_to_frequency(note: float) -> float:
@@ -28,6 +32,74 @@ class PitchObservation:
     midi: float
     confidence: float
     rms: float
+
+
+@dataclass(slots=True)
+class TimingCalibration:
+    offset_seconds: float
+    errors_by_midi: dict[int, list[float]]
+
+
+def calibration_exercise() -> Exercise:
+    """Build six open strings with a rest and four-count between notes."""
+    notes = [
+        TabNote(step=index * 7, string=string, fret=0)
+        for index, string in enumerate(range(5, -1, -1))
+    ]
+    bars = max(1, math.ceil((notes[-1].step + 1) / 7))
+    return Exercise(
+        name="タイミング校正",
+        steps_per_beat=1,
+        beats_per_bar=7,
+        bars=bars,
+        notes=notes,
+    )
+
+
+def calibration_silent_click_steps(exercise: Exercise) -> set[int]:
+    """Return the two silent recovery beats after each non-final note."""
+    notes = sorted(exercise.notes, key=lambda note: note.step)
+    return {
+        note.step + offset
+        for note in notes[:-1]
+        for offset in (1, 2)
+    }
+
+
+def estimate_timing_calibration(
+    exercise: Exercise,
+    bpm: int,
+    observations: list[PitchObservation],
+    *,
+    count_in_beats: int = 4,
+    match_window: float = 0.45,
+    pitch_tolerance: float = 0.75,
+    minimum_per_pitch: int = 1,
+) -> TimingCalibration | None:
+    """Estimate the stable timing residual from correctly pitched plucks."""
+    errors_by_midi: dict[int, list[float]] = {}
+    unused = set(range(len(observations)))
+    for expected_time, expected_midi in expected_events(exercise, bpm, count_in_beats):
+        candidates = [
+            index for index in unused
+            if abs(observations[index].time - expected_time) <= match_window
+            and abs(observations[index].midi - expected_midi) <= pitch_tolerance
+        ]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda index: abs(observations[index].time - expected_time))
+        unused.remove(best)
+        errors_by_midi.setdefault(expected_midi, []).append(
+            observations[best].time - expected_time
+        )
+
+    expected_midis = set(OPEN_STRING_MIDI)
+    if any(len(errors_by_midi.get(midi, ())) < minimum_per_pitch for midi in expected_midis):
+        return None
+    # Give every string equal weight. The median across strings keeps a single
+    # early/late pluck from dominating the device-pair correction.
+    string_centers = [median(errors_by_midi[midi]) for midi in expected_midis]
+    return TimingCalibration(median(string_centers), errors_by_midi)
 
 
 def expected_events(exercise: Exercise, bpm: int, count_in_beats: int = 0) -> list[tuple[float, int]]:

@@ -4,15 +4,22 @@ import pytest
 import numpy as np
 
 from gt_trainer.audio import (
+    AttackPitchTracker,
     compensate_input_latency,
     detect_pitch,
     playback_end_step,
     render_exercise,
+    render_note_preview,
+    rms_to_level,
 )
 from gt_trainer.models import Exercise, TabNote, format_tab_cell, parse_tab_cell
 from gt_trainer.music import (
     PitchObservation,
+    calibration_exercise,
+    calibration_silent_click_steps,
+    estimate_timing_calibration,
     evaluate_performance,
+    expected_events,
     frequency_to_midi,
     midi_to_frequency,
     score_attempts,
@@ -44,6 +51,105 @@ def test_input_latency_is_subtracted_safely() -> None:
     assert compensate_input_latency(1.0, 0.0058) == pytest.approx(0.9942)
     assert compensate_input_latency(0.002, 0.0058) == 0.0
     assert compensate_input_latency(1.0, float("nan")) == 1.0
+
+
+def test_input_level_maps_rms_to_visible_range() -> None:
+    assert rms_to_level(0.0) == 0.0
+    assert rms_to_level(10 ** -1.5) == pytest.approx(0.5)
+    assert rms_to_level(1.0) == 1.0
+
+
+def test_note_preview_renders_and_normalizes_a_chord() -> None:
+    audio = render_note_preview([40, 47, 52], duration=0.2, sample_rate=8_000)
+
+    assert len(audio) == 1_600
+    assert np.any(audio != 0)
+    assert np.max(np.abs(audio)) <= 0.95
+
+
+def test_attack_tracker_keeps_attack_time_and_ignores_sustain() -> None:
+    sample_rate = 48_000
+    block_size = 1024
+    tracker = AttackPitchTracker(sample_rate, analysis_samples=4096)
+
+    def tone(frequency: float, block: int, amplitude: float = 0.3) -> np.ndarray:
+        time = np.arange(block * block_size, (block + 1) * block_size) / sample_rate
+        return (np.sin(2 * np.pi * frequency * time) * amplitude).astype(np.float32)
+
+    assert tracker.process(np.zeros(block_size, dtype=np.float32), 0.0) is None
+    assert tracker.process(tone(82.41, 0), 1.0) is None
+    for index in range(1, 4):
+        assert tracker.process(
+            tone(82.41, index), 1.0 + index * block_size / sample_rate
+        ) is None
+    observation = tracker.process(tone(82.41, 4), 1.0 + 4 * block_size / sample_rate)
+
+    assert observation is not None
+    assert observation.time == pytest.approx(1.0 + block_size / sample_rate / 2)
+    assert observation.midi == pytest.approx(40.0, abs=0.25)
+    for index in range(5, 14):
+        assert tracker.process(tone(82.41, index), 1.0 + index * block_size / sample_rate) is None
+
+    assert tracker.process(tone(110.0, 14, 0.55), 1.0 + 14 * block_size / sample_rate) is None
+    for index in range(15, 18):
+        assert tracker.process(
+            tone(110.0, index), 1.0 + index * block_size / sample_rate
+        ) is None
+    next_observation = tracker.process(
+        tone(110.0, 18), 1.0 + 18 * block_size / sample_rate
+    )
+    assert next_observation is not None
+    assert next_observation.midi == pytest.approx(45.0, abs=0.25)
+
+
+def test_timing_calibration_uses_all_open_strings_and_rejects_outlier() -> None:
+    exercise = calibration_exercise()
+    events = expected_events(exercise, 90, count_in_beats=4)
+    observations = [
+        PitchObservation(
+            time=expected_time + (0.31 if index == 0 else 0.12),
+            midi=expected_midi,
+            confidence=0.9,
+            rms=0.2,
+        )
+        for index, (expected_time, expected_midi) in enumerate(events)
+    ]
+
+    estimate = estimate_timing_calibration(
+        exercise, 90, observations, count_in_beats=4
+    )
+
+    assert estimate is not None
+    assert estimate.offset_seconds == pytest.approx(0.12)
+    assert set(estimate.errors_by_midi) == {40, 45, 50, 55, 59, 64}
+
+
+def test_calibration_has_four_count_beats_before_each_of_six_notes() -> None:
+    exercise = calibration_exercise()
+
+    assert [(note.step, note.string) for note in exercise.notes] == [
+        (0, 5), (7, 4), (14, 3), (21, 2), (28, 1), (35, 0),
+    ]
+    assert calibration_silent_click_steps(exercise) == {
+        1, 2, 8, 9, 15, 16, 22, 23, 29, 30,
+    }
+
+
+def test_calibration_audio_has_two_silent_beats_before_countdown() -> None:
+    exercise = calibration_exercise()
+    audio = render_exercise(
+        exercise,
+        60,
+        count_in_beats=0,
+        include_notes=False,
+        sample_rate=1_000,
+        silent_click_steps=calibration_silent_click_steps(exercise),
+    )
+
+    assert not np.any(audio[1_000:2_000])
+    assert not np.any(audio[2_000:3_000])
+    assert np.any(audio[3_000:4_000])
+    assert np.any(audio[7_000:8_000])
 
 
 def test_playback_range_stops_at_last_remaining_note() -> None:

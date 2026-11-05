@@ -44,6 +44,14 @@ def compensate_input_latency(elapsed: float, latency: float) -> float:
     return max(0.0, elapsed - max(0.0, latency))
 
 
+def rms_to_level(rms: float) -> float:
+    """Map RMS amplitude to a 0..1 meter value over a -60..0 dB range."""
+    if not np.isfinite(rms) or rms <= 0:
+        return 0.0
+    decibels = 20.0 * np.log10(max(rms, 1e-6))
+    return float(np.clip((decibels + 60.0) / 60.0, 0.0, 1.0))
+
+
 def _pluck(frequency: float, duration: float, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     count = max(1, int(duration * sample_rate))
     t = np.arange(count, dtype=np.float32) / sample_rate
@@ -65,6 +73,23 @@ def _click(accent: bool, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return (np.sin(2 * np.pi * frequency * t) * np.exp(-70 * t) * (0.65 if accent else 0.45)).astype(np.float32)
 
 
+def render_note_preview(
+    midi_notes: list[int],
+    *,
+    duration: float = 0.55,
+    sample_rate: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Render notes as one simultaneous, normalized editor preview."""
+    audio = np.zeros(max(1, int(duration * sample_rate)), dtype=np.float32)
+    for midi_note in midi_notes:
+        sound = _pluck(midi_to_frequency(midi_note), duration, sample_rate)
+        audio[:len(sound)] += sound
+    peak = float(np.max(np.abs(audio)))
+    if peak > 0.95:
+        audio *= 0.95 / peak
+    return audio
+
+
 def playback_end_step(exercise: Exercise, start_step: int = 0) -> int | None:
     """Return the end of the last note that starts at or after start_step."""
     ends = [
@@ -83,6 +108,7 @@ def render_exercise(
     include_notes: bool = True,
     sample_rate: int = SAMPLE_RATE,
     start_step: int = 0,
+    silent_click_steps: set[int] | None = None,
 ) -> np.ndarray:
     start_step = min(max(0, start_step), exercise.total_steps)
     end_step = playback_end_step(exercise, start_step) or start_step
@@ -101,7 +127,10 @@ def render_exercise(
         (start_step + exercise.steps_per_beat - 1) // exercise.steps_per_beat
     ) * exercise.steps_per_beat
     body_offset = count_in_beats * beat_seconds
+    silent_click_steps = silent_click_steps or set()
     for step in range(first_beat_step, end_step, exercise.steps_per_beat):
+        if step in silent_click_steps:
+            continue
         start = int((body_offset + (step - start_step) * step_seconds) * sample_rate)
         beat = step // exercise.steps_per_beat
         sound = _click(beat % exercise.beats_per_bar == 0, sample_rate)
@@ -165,6 +194,67 @@ def detect_pitch(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> tuple[f
     return frequency, confidence
 
 
+class AttackPitchTracker:
+    """Detect plucks and estimate pitch from samples captured after the attack.
+
+    The attack timestamp is retained while pitch analysis waits for a clean
+    post-attack window. A sustained tone therefore cannot create periodic
+    observations for later score positions.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        analysis_samples: int = 4096,
+        confidence_threshold: float = 0.32,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.analysis_samples = analysis_samples
+        self.confidence_threshold = confidence_threshold
+        self.previous_rms = 0.0
+        self.last_attack_time = -1.0
+        self.pending_attack_time: float | None = None
+        self.pending_rms = 0.0
+        self.pending_samples = np.empty(0, dtype=np.float32)
+
+    def process(self, samples: np.ndarray, chunk_start_time: float) -> PitchObservation | None:
+        chunk = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if not len(chunk):
+            return None
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        duration = len(chunk) / self.sample_rate
+        midpoint = chunk_start_time + duration / 2.0
+        attack = (
+            self.pending_attack_time is None
+            and midpoint - self.last_attack_time >= 0.08
+            and rms > max(0.009, self.previous_rms * 1.35)
+        )
+        result = None
+        if attack:
+            self.pending_attack_time = midpoint
+            self.pending_rms = rms
+            self.pending_samples = np.empty(0, dtype=np.float32)
+            self.last_attack_time = midpoint
+        elif self.pending_attack_time is not None:
+            # The callback containing the rise can still be dominated by the
+            # preceding note. Use only callbacks captured after that rise.
+            self.pending_samples = np.concatenate((self.pending_samples, chunk))
+            if len(self.pending_samples) >= self.analysis_samples:
+                window = self.pending_samples[:self.analysis_samples]
+                frequency, confidence = detect_pitch(window, self.sample_rate)
+                if frequency is not None and confidence >= self.confidence_threshold:
+                    result = PitchObservation(
+                        self.pending_attack_time,
+                        frequency_to_midi(frequency),
+                        confidence,
+                        self.pending_rms,
+                    )
+                self.pending_attack_time = None
+                self.pending_samples = np.empty(0, dtype=np.float32)
+        self.previous_rms = self.previous_rms * 0.7 + rms * 0.3
+        return result
+
+
 class AudioEngine(QObject):
     position_changed = Signal(int)
     playback_finished = Signal(list, bool)
@@ -172,6 +262,8 @@ class AudioEngine(QObject):
     metronome_changed = Signal(bool)
     observation_detected = Signal(float, float, float)
     input_latency_changed = Signal(float)
+    input_level_changed = Signal(float)
+    input_monitor_error = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -179,6 +271,8 @@ class AudioEngine(QObject):
         self._thread: threading.Thread | None = None
         self._metronome_thread: threading.Thread | None = None
         self._metronome_stop = threading.Event()
+        self._input_monitor_thread: threading.Thread | None = None
+        self._input_monitor_stop = threading.Event()
 
     @property
     def busy(self) -> bool:
@@ -195,16 +289,19 @@ class AudioEngine(QObject):
         include_notes: bool = True,
         count_in_beats: int = 4,
         start_step: int = 0,
+        timing_offset: float = 0.0,
+        silent_click_steps: set[int] | None = None,
     ) -> None:
         if self.busy:
             return
         self.stop_metronome()
+        self.stop_input_monitor()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._play_worker,
             args=(
                 exercise, bpm, output_device, input_device, assess, include_notes,
-                count_in_beats, start_step,
+                count_in_beats, start_step, timing_offset, silent_click_steps,
             ),
             daemon=True,
         )
@@ -220,6 +317,8 @@ class AudioEngine(QObject):
         include_notes: bool,
         count_in_beats: int,
         start_step: int,
+        timing_offset: float,
+        silent_click_steps: set[int] | None,
     ) -> None:
         import sounddevice as sd
 
@@ -227,20 +326,19 @@ class AudioEngine(QObject):
         failed = False
         stream = None
         started = time.monotonic()
-        previous_rms = 0.0
-        last_observation = -1.0
-        analysis_buffer = np.empty(0, dtype=np.float32)
+        tracker = AttackPitchTracker()
         analysis_error_reported = False
         input_latency = 0.0
+        capture_enabled = threading.Event()
 
         def input_callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
-            nonlocal previous_rms, last_observation, analysis_buffer, analysis_error_reported
-            if status:
+            nonlocal analysis_error_reported
+            if status or not capture_enabled.is_set():
                 return
             try:
                 chunk = np.asarray(indata[:, 0], dtype=np.float32).copy()
-                analysis_buffer = np.concatenate((analysis_buffer, chunk))[-4096:]
                 rms = float(np.sqrt(np.mean(chunk * chunk)))
+                self.input_level_changed.emit(rms_to_level(rms))
                 callback_latency = input_latency
                 try:
                     measured = float(time_info.currentTime - time_info.inputBufferAdcTime)
@@ -248,17 +346,21 @@ class AudioEngine(QObject):
                         callback_latency = measured
                 except (AttributeError, TypeError, ValueError):
                     pass
-                now = compensate_input_latency(time.monotonic() - started, callback_latency)
-                attack = rms > max(0.009, previous_rms * 1.35)
-                periodic = rms > 0.012 and now - last_observation > 0.10
-                if len(analysis_buffer) >= 2048 and (attack or periodic):
-                    frequency, confidence = detect_pitch(analysis_buffer)
-                    if frequency is not None and confidence >= 0.32:
-                        midi = frequency_to_midi(frequency)
-                        observations.append(PitchObservation(now, midi, confidence, rms))
-                        self.observation_detected.emit(now, midi, confidence)
-                        last_observation = now
-                previous_rms = previous_rms * 0.7 + rms * 0.3
+                chunk_start = compensate_input_latency(
+                    time.monotonic() - started, callback_latency
+                )
+                observation = tracker.process(chunk, chunk_start)
+                if observation is not None:
+                    corrected = PitchObservation(
+                        max(0.0, observation.time - timing_offset),
+                        observation.midi,
+                        observation.confidence,
+                        observation.rms,
+                    )
+                    observations.append(corrected)
+                    self.observation_detected.emit(
+                        corrected.time, corrected.midi, corrected.confidence
+                    )
             except Exception as exc:
                 # Exceptions escaping a PortAudio callback are rendered as a
                 # Python-CFFI error dialog and leave the session half-alive.
@@ -271,6 +373,7 @@ class AudioEngine(QObject):
             audio = render_exercise(
                 exercise, bpm, count_in_beats=count_in_beats,
                 include_notes=include_notes, sample_rate=SAMPLE_RATE, start_step=start_step,
+                silent_click_steps=silent_click_steps,
             )
             if assess:
                 stream = sd.InputStream(
@@ -282,6 +385,7 @@ class AudioEngine(QObject):
                 input_latency = float(latency_value[0] if isinstance(latency_value, tuple) else latency_value)
                 self.input_latency_changed.emit(input_latency)
             started = time.monotonic()
+            capture_enabled.set()
             sd.play(audio, samplerate=SAMPLE_RATE, device=output_device, blocking=False)
             step_seconds = 60.0 / bpm / exercise.steps_per_beat
             body_start = count_in_beats * 60.0 / bpm
@@ -289,11 +393,14 @@ class AudioEngine(QObject):
             last_step = -2
             while sd.get_stream().active and not self._stop.is_set():
                 elapsed = time.monotonic() - started
-                step = (
-                    -1
-                    if elapsed < body_start
-                    else min(end_step - 1, start_step + int((elapsed - body_start) / step_seconds))
-                )
+                if elapsed < body_start:
+                    count_beat = int(elapsed / (60.0 / bpm))
+                    step = min(-1, count_beat - count_in_beats)
+                else:
+                    step = min(
+                        end_step - 1,
+                        start_step + int((elapsed - body_start) / step_seconds),
+                    )
                 if step != last_step:
                     self.position_changed.emit(step)
                     last_step = step
@@ -306,6 +413,7 @@ class AudioEngine(QObject):
             if stream is not None:
                 stream.stop()
                 stream.close()
+            self.input_level_changed.emit(0.0)
             self.position_changed.emit(-1)
             self.playback_finished.emit(observations, self._stop.is_set() or failed)
 
@@ -316,6 +424,65 @@ class AudioEngine(QObject):
             sd.stop()
         except Exception:
             pass
+
+    def preview_notes(self, midi_notes: list[int], output_device: int | None) -> None:
+        """Play a short editor audition without blocking the GUI thread."""
+        if self.busy or not midi_notes:
+            return
+        notes = list(midi_notes)
+
+        def worker() -> None:
+            try:
+                import sounddevice as sd
+
+                audio = render_note_preview(notes)
+                sd.play(audio, samplerate=SAMPLE_RATE, device=output_device, blocking=False)
+            except Exception as exc:
+                self.error.emit(str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_input_monitor(self, input_device: int | None) -> None:
+        if self.busy:
+            return
+        self.stop_input_monitor()
+        self._input_monitor_stop.clear()
+
+        def worker() -> None:
+            import sounddevice as sd
+
+            def callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
+                if status:
+                    return
+                chunk = np.asarray(indata[:, 0], dtype=np.float32)
+                rms = float(np.sqrt(np.mean(chunk * chunk)))
+                self.input_level_changed.emit(rms_to_level(rms))
+
+            try:
+                with sd.InputStream(
+                    device=input_device,
+                    channels=1,
+                    samplerate=SAMPLE_RATE,
+                    blocksize=1024,
+                    callback=callback,
+                ):
+                    self._input_monitor_stop.wait()
+            except Exception as exc:
+                if not self._input_monitor_stop.is_set():
+                    self.input_monitor_error.emit(str(exc))
+            finally:
+                self.input_level_changed.emit(0.0)
+
+        self._input_monitor_thread = threading.Thread(target=worker, daemon=True)
+        self._input_monitor_thread.start()
+
+    def stop_input_monitor(self) -> None:
+        self._input_monitor_stop.set()
+        thread = self._input_monitor_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._input_monitor_thread = None
+        self.input_level_changed.emit(0.0)
 
     def start_metronome(self, bpm: int, beats_per_bar: int, output_device: int | None) -> None:
         if self._metronome_thread and self._metronome_thread.is_alive():

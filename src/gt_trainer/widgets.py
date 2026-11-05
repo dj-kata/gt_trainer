@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSpinBox,
     QStyledItemDelegate,
     QTableWidget,
@@ -32,6 +34,68 @@ from .storage import Storage
 TAB_CLIPBOARD_MIME = "application/x-gt-trainer-tab"
 
 
+class CalibrationDialog(QDialog):
+    def __init__(self, exercise: Exercise, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.exercise = exercise
+        self.notes = sorted(exercise.notes, key=lambda note: note.step)
+        self.setWindowTitle("タイミング校正")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+        title = QLabel("開放弦タイミング校正")
+        title.setObjectName("pageTitle")
+        layout.addWidget(title)
+        help_text = QLabel(
+            "4・3・2・1の次の強いクリックで、表示された開放弦を1回だけ弾いてください。\n"
+            "演奏後はクリックが2拍止まり、次のカウントが始まります。全6音です。"
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        self.current = QLabel("次は6弦開放です\nカウント 4")
+        self.current.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.current.setStyleSheet("font-size: 24px; font-weight: 700; padding: 18px;")
+        layout.addWidget(self.current)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, len(self.notes))
+        layout.addWidget(self.progress)
+        cancel = QPushButton("中止")
+        cancel.clicked.connect(self.reject)
+        layout.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def set_step(self, step: int) -> None:
+        if step < 0:
+            first_string = self.notes[0].string + 1
+            self.current.setText(
+                f"次は{first_string}弦開放です\nカウント {abs(step)}"
+            )
+            return
+        completed = sum(note.step <= step for note in self.notes)
+        self.progress.setValue(completed)
+        upcoming = next((note for note in self.notes if note.step >= step), None)
+        if upcoming is None:
+            self.current.setText("測定結果を計算しています…")
+            self.progress.setValue(len(self.notes))
+            return
+        if upcoming.step == step:
+            self.current.setText(
+                f"今：{upcoming.string + 1}弦開放を鳴らしてください"
+            )
+            return
+        previous = next((note for note in reversed(self.notes) if note.step < step), None)
+        distance = step - previous.step if previous is not None else step + 1
+        if distance <= 2:
+            remaining = 3 - distance
+            self.current.setText(
+                f"次は{upcoming.string + 1}弦開放です\n休止中（あと{remaining}拍）"
+            )
+            return
+        count = 7 - distance
+        self.current.setText(
+            f"次は{upcoming.string + 1}弦開放です\nカウント {count}"
+        )
+
+
 def card(title: str) -> tuple[QGroupBox, QVBoxLayout]:
     box = QGroupBox(title)
     layout = QVBoxLayout(box)
@@ -42,6 +106,7 @@ def card(title: str) -> tuple[QGroupBox, QVBoxLayout]:
 
 class TabCellDelegate(QStyledItemDelegate):
     advance_requested = Signal(int, int)
+    edit_committed = Signal(int, int)
     undo_requested = Signal()
     redo_requested = Signal()
     grid_shortcut_requested = Signal(int)
@@ -61,6 +126,11 @@ class TabCellDelegate(QStyledItemDelegate):
         width = max(64, rect.width())
         x = min(rect.x(), max(0, editor.parent().width() - width))
         editor.setGeometry(QRect(x, rect.y(), width, rect.height()))
+
+    def setModelData(self, editor, model, index) -> None:  # noqa: ANN001, N802
+        super().setModelData(editor, model, index)
+        if parse_tab_cell(str(model.data(index) or "")) is not None:
+            self.edit_committed.emit(index.row(), index.column())
 
     def eventFilter(self, editor, event) -> bool:  # noqa: ANN001, N802
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -163,10 +233,12 @@ class TimelineHeader(QHeaderView):
 
 class TabGrid(QTableWidget):
     timeline_geometry_changed = Signal()
+    audition_requested = Signal(list)
 
     def __init__(self) -> None:
         super().__init__(6, 16)
         self.steps_per_beat = 4
+        self.beats_per_bar = 4
         self._edit_history: list[list[tuple[int, int, str, str]]] = []
         self._history_index = 0
         self._applying_history = False
@@ -194,6 +266,7 @@ class TabGrid(QTableWidget):
             self.setRowHeight(row, 22)
         delegate = TabCellDelegate(self)
         delegate.advance_requested.connect(self._advance_after_edit)
+        delegate.edit_committed.connect(self._audition_column)
         delegate.undo_requested.connect(self.undo_edit)
         delegate.redo_requested.connect(self.redo_edit)
         delegate.grid_shortcut_requested.connect(self._handle_control_shortcut)
@@ -438,6 +511,16 @@ class TabGrid(QTableWidget):
         if next_item and self.editTriggers() != QAbstractItemView.EditTrigger.NoEditTriggers:
             self.editItem(next_item)
 
+    def _audition_column(self, row: int, column: int) -> None:
+        del row
+        midi_notes = [
+            note.midi_note
+            for note in self.notes()
+            if note.step == column
+        ]
+        if midi_notes:
+            self.audition_requested.emit(midi_notes)
+
     def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
         if self.editTriggers() != QAbstractItemView.EditTrigger.NoEditTriggers:
             if event.matches(QKeySequence.StandardKey.Undo):
@@ -468,6 +551,7 @@ class TabGrid(QTableWidget):
         values = self.notes()
         blocked = self.blockSignals(True)
         self.steps_per_beat = steps_per_beat
+        self.beats_per_bar = beats_per_bar
         self.horizontalHeader().configure(steps_per_beat, beats_per_bar)
         self.setColumnCount(total_steps)
         labels = []
@@ -533,14 +617,30 @@ class TabGrid(QTableWidget):
                 if item:
                     item.setBackground(shade)
         if 0 <= step < self.columnCount():
-            target = self.item(0, step)
-            if target:
-                self.scrollToItem(target, QAbstractItemView.ScrollHint.EnsureVisible)
+            self._scroll_playhead_ahead(step)
+
+    def _scroll_playhead_ahead(self, step: int) -> None:
+        """Keep the current step visible with up to one full bar ahead."""
+        header = self.horizontalHeader()
+        steps_per_bar = max(1, self.steps_per_beat * self.beats_per_bar)
+        last_ahead = min(self.columnCount() - 1, step + steps_per_bar - 1)
+        current_left = header.sectionPosition(step)
+        ahead_right = (
+            header.sectionPosition(last_ahead) + header.sectionSize(last_ahead)
+        )
+        padding = 8
+        scroll_for_full_bar = ahead_right + padding - self.viewport().width()
+        scroll_keeping_cursor = current_left - padding
+        self.horizontalScrollBar().setValue(max(
+            0,
+            min(scroll_for_full_bar, scroll_keeping_cursor),
+        ))
 
 
 class EditorPage(QWidget):
     saved = Signal()
     preview_requested = Signal(Exercise, int)
+    notes_audition_requested = Signal(list)
     stop_requested = Signal()
 
     def __init__(self, storage: Storage) -> None:
@@ -594,6 +694,7 @@ class EditorPage(QWidget):
         root.addWidget(self.staff)
         self.grid.horizontalScrollBar().valueChanged.connect(self._sync_staff_timeline)
         self.grid.timeline_geometry_changed.connect(self._sync_staff_timeline)
+        self.grid.audition_requested.connect(self.notes_audition_requested.emit)
         buttons = QHBoxLayout()
         new_button = QPushButton("新規")
         new_button.clicked.connect(self.new_exercise)
@@ -793,8 +894,11 @@ class PracticePage(QWidget):
     def add_detected_note(self, observed_time: float, midi: float) -> None:
         self.staff.add_observation(observed_time, midi)
 
-    def set_input_latency(self, latency_seconds: float) -> None:
-        self.status.setText(f"入力音を採点しています…（入力遅延 {latency_seconds * 1000:.1f} ms 補正）")
+    def set_input_latency(self, latency_seconds: float, timing_offset: float = 0.0) -> None:
+        self.status.setText(
+            "入力音を採点しています…"
+            f"（入力 {latency_seconds * 1000:.1f} ms / 校正 {timing_offset * 1000:+.0f} ms）"
+        )
 
 
 class ProgressPage(QWidget):
