@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
         self.active_menu_details: list[tuple[str, int, float]] = []
         self.active_menu_id: int | None = None
         self.active_menu_run_id: str | None = None
+        self.active_menu_guide_notes = False
         self._menu_cancelled = False
         self.active_calibration = False
         self.calibration_dialog: CalibrationDialog | None = None
@@ -143,6 +144,9 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.practice = PracticePage(storage)
+        self.practice.assessment_guide_notes.setChecked(
+            self.settings.value("assessment_guide_notes", False, type=bool)
+        )
         self.editor = EditorPage(storage)
         self.editor.set_bpm(self.bpm.value())
         self.progress = ProgressPage(storage)
@@ -181,6 +185,15 @@ class MainWindow(QMainWindow):
         self.bpm.valueChanged.connect(self.editor.set_bpm)
         self.refresh_devices()
         self.show_page(0)
+        self._restore_window_geometry()
+
+    def _restore_window_geometry(self) -> None:
+        geometry = self.settings.value("window_geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+    def _save_window_geometry(self) -> None:
+        self.settings.setValue("window_geometry", self.saveGeometry())
 
     def show_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
@@ -299,6 +312,7 @@ class MainWindow(QMainWindow):
         start_step: int = 0,
         *,
         bpm_override: int | None = None,
+        include_guide_notes: bool = False,
     ) -> None:
         if self.audio.busy:
             return
@@ -320,6 +334,7 @@ class MainWindow(QMainWindow):
             assess,
             count_in_beats=exercise.beats_per_bar,
             start_step=start_step,
+            include_guide_notes=include_guide_notes,
         )
 
     def _play_exercise(
@@ -330,6 +345,7 @@ class MainWindow(QMainWindow):
         *,
         count_in_beats: int,
         start_step: int = 0,
+        include_guide_notes: bool = False,
     ) -> None:
         self.active_exercise = exercise
         self.active_assessment = assess
@@ -337,16 +353,25 @@ class MainWindow(QMainWindow):
         self.active_count_in_beats = count_in_beats
         self.practice.show_exercise(exercise, bpm, context="再生中")
         self.practice.prepare_staff(exercise, bpm, count_in_beats)
-        # During assessment, the guide notes are muted so they cannot leak into pitch detection.
+        if start_step == 0:
+            self.practice.scroll_score_to_start()
+        # Guide notes stay muted by default during assessment to avoid leaking
+        # output into pitch detection, but the player can explicitly enable them.
         self.audio.play(
             exercise, bpm, self.output_device.currentData(),
             input_device=self.input_device.currentData(), assess=assess,
-            include_notes=not assess, count_in_beats=count_in_beats,
+            include_notes=not assess or include_guide_notes,
+            count_in_beats=count_in_beats,
             start_step=start_step,
             timing_offset=self._timing_offset() if assess else 0.0,
         )
 
-    def start_practice_menu(self, menu: PracticeMenu, assess: bool) -> None:
+    def start_practice_menu(
+        self,
+        menu: PracticeMenu,
+        assess: bool,
+        include_guide_notes: bool = False,
+    ) -> None:
         if self.audio.busy:
             return
         items = []
@@ -378,6 +403,7 @@ class MainWindow(QMainWindow):
             if assess
             else None
         )
+        self.active_menu_guide_notes = assess and include_guide_notes
         self.practice.set_running(True, assess)
         self.editor.set_running(True)
         self._start_menu_item(0)
@@ -399,6 +425,7 @@ class MainWindow(QMainWindow):
             bpm,
             self.active_menu_assessment,
             count_in_beats=count_in,
+            include_guide_notes=self.active_menu_guide_notes,
         )
 
     def _start_menu_interval(self) -> None:
@@ -412,6 +439,7 @@ class MainWindow(QMainWindow):
             next_index, len(self.active_menu_items), exercise.name, bpm, interval=True,
         )
         self.practice.show_exercise(exercise, bpm, context="次に再生")
+        self.practice.scroll_score_to_start()
         self.audio.play_interval(
             bpm, exercise.beats_per_bar, self.output_device.currentData()
         )
@@ -546,6 +574,7 @@ class MainWindow(QMainWindow):
         self.active_menu_name = ""
         self.active_menu_id = None
         self.active_menu_run_id = None
+        self.active_menu_guide_notes = False
         self.active_menu_assessment = False
         self.active_menu_phase = None
         self.active_menu_attempts = []
@@ -618,10 +647,16 @@ class MainWindow(QMainWindow):
         self.audio.stop_metronome()
         self.audio.stop_input_monitor()
         self.settings.setValue("bpm", self.bpm.value())
+        self.settings.setValue(
+            "assessment_guide_notes",
+            self.practice.assessment_guide_notes.isChecked(),
+        )
+        self._save_window_geometry()
         if self.input_device.currentData() is not None:
             self.settings.setValue("input_device", self.input_device.currentData())
         if self.output_device.currentData() is not None:
             self.settings.setValue("output_device", self.output_device.currentData())
+        self.settings.sync()
         self.storage.close()
         super().closeEvent(event)
 

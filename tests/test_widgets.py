@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from PySide6.QtCore import QEvent, QRect, Qt
 from PySide6.QtGui import QKeyEvent
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from gt_trainer.staff import StaffWidget
 from gt_trainer.fretboard import FretboardWidget
+from gt_trainer.main_window import MainWindow
 from gt_trainer.models import Exercise, PracticeMenuItem, SessionResult, TabNote
 from gt_trainer.storage import Storage
 from gt_trainer.music import calibration_exercise
@@ -416,6 +418,32 @@ def test_fretboard_highlights_all_notes_at_playhead() -> None:
     application.processEvents()
 
 
+def test_fretboard_frames_fretted_range_for_current_bar() -> None:
+    application = QApplication.instance() or QApplication([])
+    fretboard = FretboardWidget()
+    fretboard.set_exercise(Exercise(
+        steps_per_beat=4,
+        beats_per_bar=4,
+        notes=[
+            TabNote(step=15, string=0, fret=5, duration_steps=2),
+            TabNote(step=16, string=1, fret=0),
+            TabNote(step=20, string=2, fret=7),
+            TabNote(step=31, string=3, fret=12),
+            TabNote(step=32, string=4, fret=15),
+        ],
+    ))
+
+    assert fretboard.current_bar_fret_range() is None
+    fretboard.set_playhead(16)
+    assert fretboard.current_bar_fret_range() == (5, 12)
+    fretboard.set_playhead(32)
+    assert fretboard.current_bar_fret_range() == (15, 15)
+    fretboard.set_playhead(-1)
+    assert fretboard.current_bar_fret_range() is None
+    fretboard.close()
+    application.processEvents()
+
+
 def test_fretboard_marks_major_root_third_and_fifth_across_all_positions() -> None:
     application = QApplication.instance() or QApplication([])
     fretboard = FretboardWidget()
@@ -629,8 +657,12 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
     assert "70 BPM" in page.preview_duration_label.text()
     requested = []
     page.start_menu_requested.connect(
-        lambda selected_menu, assess: requested.append((selected_menu, assess))
+        lambda selected_menu, assess, guide: requested.append(
+            (selected_menu, assess, guide)
+        )
     )
+    assert not page.assessment_guide_notes.isChecked()
+    page.assessment_guide_notes.setChecked(True)
     page.practice_button.click()
     assert page.practice_tabs.currentIndex() == 1
     assert page.play_button.text() == "▶  メニュー全体を再生"
@@ -640,6 +672,11 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
         (exercise.id, 60), (exercise.id, 70),
     ]
     assert requested[0][1]
+    assert requested[0][2]
+    page.set_running(True, True)
+    assert not page.assessment_guide_notes.isEnabled()
+    assert "お手本音あり" in page.status.text()
+    page.set_running(False)
     item_previews = []
     page.preview_item_requested.connect(
         lambda selected_exercise, bpm: item_previews.append((selected_exercise.id, bpm))
@@ -653,6 +690,86 @@ def test_practice_menu_allows_duplicate_scores_with_independent_bpms(tmp_path) -
     page.close()
     storage.close()
     application.processEvents()
+
+
+def test_playback_options_control_guide_audio_and_start_scroll() -> None:
+    calls = []
+    scroll_resets = []
+    exercise = Exercise(name="譜面A", notes=[TabNote(0, 5, 0)])
+    window = SimpleNamespace(
+        practice=SimpleNamespace(
+            show_exercise=lambda *args, **kwargs: None,
+            prepare_staff=lambda *args, **kwargs: None,
+            scroll_score_to_start=lambda: scroll_resets.append(True),
+        ),
+        audio=SimpleNamespace(
+            play=lambda *args, **kwargs: calls.append(kwargs),
+        ),
+        output_device=SimpleNamespace(currentData=lambda: 1),
+        input_device=SimpleNamespace(currentData=lambda: 2),
+        _timing_offset=lambda: 0.0,
+    )
+
+    MainWindow._play_exercise(
+        window, exercise, 90, True,
+        count_in_beats=4, include_guide_notes=False,
+    )
+    MainWindow._play_exercise(
+        window, exercise, 90, True,
+        count_in_beats=4, start_step=4, include_guide_notes=True,
+    )
+
+    assert [call["include_notes"] for call in calls] == [False, True]
+    assert scroll_resets == [True]
+
+
+def test_menu_interval_immediately_shows_next_score_from_start() -> None:
+    events = []
+    first = Exercise(name="譜面A")
+    second = Exercise(name="譜面B", beats_per_bar=3)
+    window = SimpleNamespace(
+        active_menu_index=0,
+        active_menu_items=[(first, 60), (second, 30)],
+        active_menu_phase="exercise",
+        _menu_cancelled=False,
+        practice=SimpleNamespace(
+            set_menu_progress=lambda *args, **kwargs: events.append("progress"),
+            show_exercise=lambda *args, **kwargs: events.append("show"),
+            scroll_score_to_start=lambda: events.append("scroll"),
+        ),
+        audio=SimpleNamespace(
+            play_interval=lambda *args: events.append("interval"),
+        ),
+        output_device=SimpleNamespace(currentData=lambda: 1),
+    )
+
+    MainWindow._start_menu_interval(window)
+
+    assert window.active_menu_phase == "interval"
+    assert events == ["progress", "show", "scroll", "interval"]
+
+
+def test_main_window_saves_and_restores_geometry() -> None:
+    values = {}
+    restored = []
+    settings = SimpleNamespace(
+        value=lambda key: values.get(key),
+        setValue=lambda key, value: values.__setitem__(key, value),
+    )
+    window = SimpleNamespace(
+        settings=settings,
+        saveGeometry=lambda: b"saved-window-geometry",
+        restoreGeometry=lambda geometry: restored.append(geometry),
+    )
+
+    MainWindow._restore_window_geometry(window)
+    assert restored == []
+
+    MainWindow._save_window_geometry(window)
+    MainWindow._restore_window_geometry(window)
+
+    assert values["window_geometry"] == b"saved-window-geometry"
+    assert restored == [b"saved-window-geometry"]
 
 
 def test_progress_report_separates_conditions_and_compares_completed_menu_runs(

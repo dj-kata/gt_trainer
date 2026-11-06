@@ -47,6 +47,28 @@ class FretboardWidget(QWidget):
             key=lambda note: (note.string, note.fret),
         )
 
+    def current_bar_fret_range(self) -> tuple[int, int] | None:
+        """Return the fretted hand-position range used by the current bar."""
+        if self.playhead_step < 0:
+            return None
+        steps_per_bar = max(
+            1,
+            self.exercise.steps_per_beat * self.exercise.beats_per_bar,
+        )
+        bar_start = self.playhead_step // steps_per_bar * steps_per_bar
+        bar_end = bar_start + steps_per_bar
+        frets = [
+            note.fret
+            for note in self.exercise.notes
+            if (
+                0 <= note.string < 6
+                and 0 < note.fret < self.fret_count
+                and note.step < bar_end
+                and note.step + max(1, note.duration_steps) > bar_start
+            )
+        ]
+        return (min(frets), max(frets)) if frets else None
+
     def position_markers(self) -> dict[tuple[int, int], str]:
         """Return every string/fret used by the score and its pitch class."""
         return {
@@ -228,5 +250,18 @@ class FretboardWidget(QWidget):
                 Qt.AlignmentFlag.AlignCenter,
                 note_name,
             )
+
+        fret_range = self.current_bar_fret_range()
+        if fret_range is not None:
+            first_fret, last_fret = fret_range
+            position_rect = QRectF(
+                left + first_fret * fret_width + 1.5,
+                top + 1.5,
+                (last_fret - first_fret + 1) * fret_width - 3.0,
+                bottom - top - 3.0,
+            )
+            painter.setPen(QPen(QColor("#ff4d64"), 3.0))
+            painter.setBrush(QColor(255, 77, 100, 14))
+            painter.drawRoundedRect(position_rect, 4, 4)
 
         painter.end()

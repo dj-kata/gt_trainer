@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QRegularExpressi
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QGroupBox,
@@ -859,7 +860,7 @@ class EditorPage(QWidget):
 
 
 class PracticePage(QWidget):
-    start_menu_requested = Signal(object, bool)
+    start_menu_requested = Signal(object, bool, bool)
     preview_item_requested = Signal(Exercise, int)
     stop_requested = Signal()
     edit_requested = Signal(Exercise)
@@ -982,10 +983,16 @@ class PracticePage(QWidget):
         self.practice_button = QPushButton("●  メニュー全体を採点")
         self.practice_button.setObjectName("primaryButton")
         self.practice_button.clicked.connect(lambda: self._start(True))
+        self.assessment_guide_notes = QCheckBox("採点中もお手本音を再生")
+        self.assessment_guide_notes.setToolTip(
+            "オンにすると採点中も譜面の合成音を鳴らします。\n"
+            "スピーカーから入力へ回り込むと採点へ影響するため、ヘッドホンを推奨します。"
+        )
         self.stop_button = QPushButton("■  停止")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_requested.emit)
         actions.addStretch()
+        actions.addWidget(self.assessment_guide_notes)
         actions.addWidget(self.play_button)
         actions.addWidget(self.practice_button)
         actions.addWidget(self.stop_button)
@@ -1249,7 +1256,9 @@ class PracticePage(QWidget):
             QMessageBox.warning(self, "譜面が見つかりません", "削除済みの譜面をメニューから外してください。")
             return
         self.practice_tabs.setCurrentIndex(1)
-        self.start_menu_requested.emit(menu, assess)
+        self.start_menu_requested.emit(
+            menu, assess, assess and self.assessment_guide_notes.isChecked()
+        )
 
     def _edit(self) -> None:
         exercise = self.current_exercise()
@@ -1265,12 +1274,17 @@ class PracticePage(QWidget):
             self.exercise_picker, self.item_bpm, self.add_item_button, self.menu_items,
             self.move_up_button, self.move_down_button, self.remove_item_button,
             self.edit_item_button, self.preview_item_button,
+            self.assessment_guide_notes,
         ):
             widget.setEnabled(not running)
         self.preview_item_button.setEnabled(not running and self.current_exercise() is not None)
         if not running:
             self._status_context = ""
-        self.status.setText("入力音を採点しています…" if running and assess else "再生中…" if running else "練習を選んで開始してください")
+        if running and assess:
+            guide = "（お手本音あり）" if self.assessment_guide_notes.isChecked() else ""
+            self.status.setText(f"入力音を採点しています…{guide}")
+        else:
+            self.status.setText("再生中…" if running else "練習を選んで開始してください")
 
     def set_menu_progress(
         self,
@@ -1288,9 +1302,15 @@ class PracticePage(QWidget):
                 "インターバル（無音2小節 → クリック1小節）"
             )
         else:
+            guide = (
+                "（お手本音あり）"
+                if assess and self.assessment_guide_notes.isChecked()
+                else ""
+            )
             self._status_context = (
                 f"{index + 1}/{total}「{exercise_name}」 {bpm} BPM"
                 + ("　採点中" if assess else "　再生中")
+                + guide
             )
         self.status.setText(self._status_context)
 
@@ -1298,6 +1318,9 @@ class PracticePage(QWidget):
         self.staff.set_exercise(exercise, bpm, count_in_beats)
         self.fretboard.set_exercise(exercise)
         self._set_preview_duration(exercise, bpm)
+
+    def scroll_score_to_start(self) -> None:
+        self.preview_grid.horizontalScrollBar().setValue(0)
 
     def add_detected_note(self, observed_time: float, midi: float) -> None:
         self.staff.add_observation(observed_time, midi)
