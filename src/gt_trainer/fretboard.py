@@ -18,6 +18,9 @@ class FretboardWidget(QWidget):
         3: QColor("#4f88df"),
         5: QColor("#d5b83f"),
     }
+    single_position_frets = (3, 5, 7, 9, 15, 17, 19)
+    double_position_frets = (12, 24)
+    lower_position_frets = (3, 5, 7, 9, 12, 15, 17, 19, 21, 24)
 
     def __init__(self) -> None:
         super().__init__()
@@ -68,6 +71,22 @@ class FretboardWidget(QWidget):
             )
         ]
         return (min(frets), max(frets)) if frets else None
+
+    @classmethod
+    def position_inlays(cls) -> dict[int, tuple[int, ...]]:
+        """Map each marked fret to gaps after the numbered strings."""
+        return {
+            **{fret: (3,) for fret in cls.single_position_frets},
+            **{fret: (2, 4) for fret in cls.double_position_frets},
+        }
+
+    @classmethod
+    def lower_position_inlays(cls) -> dict[int, int]:
+        """Map each marker below the sixth string to its dot count."""
+        return {
+            fret: 2 if fret in cls.double_position_frets else 1
+            for fret in cls.lower_position_frets
+        }
 
     def position_markers(self) -> dict[tuple[int, int], str]:
         """Return every string/fret used by the score and its pitch class."""
@@ -183,6 +202,38 @@ class FretboardWidget(QWidget):
             thickness = 1.0 + string * 0.16
             painter.setPen(QPen(QColor("#8f9caf"), thickness))
             painter.drawLine(int(left), int(y), int(right), int(y))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(244, 247, 252, 210))
+        inlay_radius = max(
+            2.5,
+            min(4.2, fret_width * 0.16, string_height * 0.22),
+        )
+        for fret, string_gaps in self.position_inlays().items():
+            x = left + (fret + 0.5) * fret_width
+            for string_gap in string_gaps:
+                y = top + string_gap * string_height
+                painter.drawEllipse(QRectF(
+                    x - inlay_radius,
+                    y - inlay_radius,
+                    inlay_radius * 2,
+                    inlay_radius * 2,
+                ))
+
+        lower_inlay_y = (bottom + self.height()) / 2.0
+        for fret, dot_count in self.lower_position_inlays().items():
+            center_x = left + (fret + 0.5) * fret_width
+            offsets = (0.0,) if dot_count == 1 else (
+                -inlay_radius * 1.2,
+                inlay_radius * 1.2,
+            )
+            for offset in offsets:
+                painter.drawEllipse(QRectF(
+                    center_x + offset - inlay_radius,
+                    lower_inlay_y - inlay_radius,
+                    inlay_radius * 2,
+                    inlay_radius * 2,
+                ))
 
         for note in active:
             cell = QRectF(

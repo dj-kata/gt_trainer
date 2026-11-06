@@ -392,6 +392,30 @@ def test_staff_folds_extreme_guitar_notes_with_octave_marks() -> None:
     assert high.octave_label == "15ma"
 
 
+def test_staff_groups_consecutive_octave_notes_into_spans() -> None:
+    application = QApplication.instance() or QApplication([])
+    staff = StaffWidget()
+    staff.set_exercise(Exercise(notes=[
+        TabNote(step=0, string=0, fret=12),
+        TabNote(step=1, string=0, fret=14, duration_steps=2),
+        TabNote(step=3, string=0, fret=0),
+        TabNote(step=4, string=5, fret=0),
+        TabNote(step=5, string=5, fret=2),
+        TabNote(step=6, string=0, fret=24),
+    ]))
+
+    assert [
+        (span.label, span.start_step, span.end_step)
+        for span in staff.octave_spans()
+    ] == [
+        ("8va", 0, 3),
+        ("8vb", 4, 6),
+        ("15ma", 6, 7),
+    ]
+    staff.close()
+    application.processEvents()
+
+
 def test_fretboard_highlights_all_notes_at_playhead() -> None:
     application = QApplication.instance() or QApplication([])
     fretboard = FretboardWidget()
@@ -442,6 +466,32 @@ def test_fretboard_frames_fretted_range_for_current_bar() -> None:
     assert fretboard.current_bar_fret_range() is None
     fretboard.close()
     application.processEvents()
+
+
+def test_fretboard_uses_standard_position_inlays() -> None:
+    assert FretboardWidget.position_inlays() == {
+        3: (3,),
+        5: (3,),
+        7: (3,),
+        9: (3,),
+        12: (2, 4),
+        15: (3,),
+        17: (3,),
+        19: (3,),
+        24: (2, 4),
+    }
+    assert FretboardWidget.lower_position_inlays() == {
+        3: 1,
+        5: 1,
+        7: 1,
+        9: 1,
+        12: 2,
+        15: 1,
+        17: 1,
+        19: 1,
+        21: 1,
+        24: 2,
+    }
 
 
 def test_fretboard_marks_major_root_third_and_fifth_across_all_positions() -> None:

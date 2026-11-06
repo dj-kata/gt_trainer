@@ -25,6 +25,13 @@ class StaffPlacement:
     octave_label: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class OctaveSpan:
+    label: str
+    start_step: int
+    end_step: int
+
+
 class StaffWidget(QWidget):
     """Compact treble staff for expected and live-detected monophonic notes."""
 
@@ -125,6 +132,34 @@ class StaffWidget(QWidget):
         placement = self._staff_placement(midi)
         return bottom - placement.position * half_space, placement
 
+    def octave_spans(self) -> list[OctaveSpan]:
+        """Group consecutive notes that share the same octave displacement."""
+        spans: list[OctaveSpan] = []
+        current_label = ""
+        start_step = 0
+        end_step = 0
+
+        def finish_span() -> None:
+            nonlocal current_label
+            if current_label:
+                spans.append(OctaveSpan(current_label, start_step, end_step))
+                current_label = ""
+
+        for note in sorted(self.exercise.notes, key=lambda item: (item.step, item.string)):
+            label = self._staff_placement(note.midi_note).octave_label
+            note_end = note.step + max(1, note.duration_steps)
+            if not label:
+                finish_span()
+            elif label == current_label:
+                end_step = max(end_step, note_end)
+            else:
+                finish_span()
+                current_label = label
+                start_step = note.step
+                end_step = note_end
+        finish_span()
+        return spans
+
     def _draw_note(
         self,
         painter: QPainter,
@@ -135,7 +170,6 @@ class StaffWidget(QWidget):
         color: QColor,
         *,
         filled: bool,
-        show_octave_label: bool = True,
     ) -> None:
         y, placement = self._note_y(midi, bottom, half_space)
         position = placement.position
@@ -149,15 +183,6 @@ class StaffWidget(QWidget):
         if placement.accidental:
             painter.setFont(QFont("Noto Sans", 9))
             painter.drawText(QRectF(x - 17, y - 9, 10, 18), Qt.AlignmentFlag.AlignCenter, "♯")
-        if show_octave_label and placement.octave_label:
-            above = placement.octave_label.endswith(("va", "ma"))
-            label_y = y - 23 if above else y + 8
-            painter.setFont(QFont("Noto Sans", 7, QFont.Weight.Bold))
-            painter.drawText(
-                QRectF(x - 16, label_y, 32, 13),
-                Qt.AlignmentFlag.AlignCenter,
-                placement.octave_label,
-            )
         # Ledger lines outside the five-line staff.
         ledger = int(position // 2 * 2)
         if position < 0:
@@ -198,7 +223,7 @@ class StaffWidget(QWidget):
             painter.drawLine(int(left), int(y), int(right), int(y))
 
         painter.save()
-        painter.setClipRect(QRectF(left, top - 18, right - left, self.height() - top + 9))
+        painter.setClipRect(QRectF(left, 2, right - left, self.height() - 2))
 
         # Beat and bar guides. Their x positions use exactly the same pixel
         # width and scroll offset as the TAB columns above.  Guides sit on
@@ -228,6 +253,26 @@ class StaffWidget(QWidget):
                 Qt.AlignmentFlag.AlignCenter,
                 str(bar_start // steps_per_bar + 1),
             )
+
+        octave_color = QColor("#d8b4fe")
+        octave_y = top - 24
+        painter.setFont(QFont("Noto Sans", 7, QFont.Weight.Bold))
+        for span in self.octave_spans():
+            start_x = self._step_x(span.start_step)
+            end_x = self._step_boundary_x(span.end_step) - 3
+            label_rect = QRectF(start_x - 15, octave_y - 7, 30, 13)
+            painter.setPen(octave_color)
+            painter.drawText(
+                label_rect,
+                Qt.AlignmentFlag.AlignCenter,
+                span.label,
+            )
+            line_start = start_x + 17
+            line_end = max(line_start + 4, end_x)
+            painter.setPen(QPen(octave_color, 1.5, Qt.PenStyle.DashLine))
+            painter.drawLine(int(line_start), int(octave_y), int(line_end), int(octave_y))
+            painter.setPen(QPen(octave_color, 1.5))
+            painter.drawLine(int(line_end), int(octave_y), int(line_end), int(octave_y + 5))
 
         expected = sorted(self.exercise.notes, key=lambda note: (note.step, note.string))
         for index, note in enumerate(expected):
@@ -264,7 +309,6 @@ class StaffWidget(QWidget):
                 half_space,
                 color,
                 filled=True,
-                show_octave_label=False,
             )
             painter.setFont(QFont("Noto Sans", 7))
             painter.setPen(color)
@@ -280,5 +324,9 @@ class StaffWidget(QWidget):
 
         painter.setFont(QFont("Noto Sans CJK JP", 8))
         painter.setPen(QColor("#718096"))
-        painter.drawText(12, self.height() - 9, "青: 譜面　緑: 正確　橙: リズム差　赤: 音程差")
+        painter.drawText(
+            12,
+            self.height() - 9,
+            "青: 譜面　紫: オクターブ　緑: 正確　橙: リズム差　赤: 音程差",
+        )
 
